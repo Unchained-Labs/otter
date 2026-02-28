@@ -52,9 +52,11 @@ services:
       OTTER_LISTEN_ADDR: 0.0.0.0:8080
       OTTER_VIBE_BIN: vibe
       OTTER_VIBE_HOME_BASE: /var/lib/otter/vibe
+      OTTER_MIGRATIONS_DIR: /srv/otter/migrations
       OTTER_MAX_ATTEMPTS: 5
       OTTER_WORKER_CONCURRENCY: 2
       OTTER_ALLOWED_ROOTS: /workspaces
+      RUST_LOG: info
     ports:
       - "8080:8080"
     volumes:
@@ -81,8 +83,10 @@ services:
       OTTER_REDIS_URL: redis://redis:6379
       OTTER_VIBE_BIN: vibe
       OTTER_VIBE_HOME_BASE: /var/lib/otter/vibe
+      OTTER_MIGRATIONS_DIR: /srv/otter/migrations
       OTTER_MAX_ATTEMPTS: 5
       OTTER_ALLOWED_ROOTS: /workspaces
+      RUST_LOG: info
     volumes:
       - ./workspaces:/workspaces
       - vibe_state:/var/lib/otter/vibe

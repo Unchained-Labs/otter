@@ -12,7 +12,7 @@ COPY otter-worker/src otter-worker/src
 COPY otter-core/migrations otter-core/migrations
 
 ARG BIN_NAME
-RUN cargo build --release --bin ${BIN_NAME}
+RUN cargo build --release --bin otter-server --bin otter-worker
 
 FROM debian:bookworm-slim
 RUN apt-get update && \
@@ -23,6 +23,7 @@ RUN curl -LsSf https://mistral.ai/vibe/install.sh | bash && \
     ln -sf /root/.local/bin/vibe /usr/local/bin/vibe
 
 WORKDIR /srv/otter
+COPY --from=builder /app/otter-core/migrations /srv/otter/migrations
 COPY --from=builder /app/target/release/otter-server /usr/local/bin/otter-server
 COPY --from=builder /app/target/release/otter-worker /usr/local/bin/otter-worker
 

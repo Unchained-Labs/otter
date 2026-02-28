@@ -1,7 +1,7 @@
-use anyhow::Result;
+use anyhow::{bail, Result};
 use sqlx::postgres::{PgPoolOptions, PgQueryResult};
 use sqlx::PgPool;
-use std::path::Path;
+use std::path::PathBuf;
 use uuid::Uuid;
 
 use crate::domain::{
@@ -28,10 +28,24 @@ impl Database {
     }
 
     pub async fn migrate(&self) -> Result<()> {
-        let migration_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
-        let migrator = sqlx::migrate::Migrator::new(migration_path.as_path()).await?;
-        migrator.run(&self.pool).await?;
-        Ok(())
+        let mut candidates = Vec::<PathBuf>::new();
+        if let Ok(path) = std::env::var("OTTER_MIGRATIONS_DIR") {
+            candidates.push(PathBuf::from(path));
+        }
+        candidates.push(PathBuf::from("/srv/otter/migrations"));
+        candidates.push(std::env::current_dir()?.join("migrations"));
+        candidates.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("migrations"));
+
+        for path in candidates {
+            if !path.exists() {
+                continue;
+            }
+            let migrator = sqlx::migrate::Migrator::new(path.as_path()).await?;
+            migrator.run(&self.pool).await?;
+            return Ok(());
+        }
+
+        bail!("while resolving migrations: No such file or directory (os error 2)")
     }
 
     pub async fn create_project(&self, request: CreateProjectRequest) -> Result<Project> {
