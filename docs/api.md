@@ -54,6 +54,8 @@ Base URL: `http://<host>:8080`
   - Cancels queued/running jobs.
 - `GET /v1/jobs/{id}/events`
   - Returns ordered lifecycle events.
+- `GET /v1/events/stream`
+  - Server-Sent Events stream of job lifecycle events for live UI updates.
 
 ## History
 

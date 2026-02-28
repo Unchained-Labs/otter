@@ -1,11 +1,14 @@
+use std::convert::Infallible;
 use std::sync::Arc;
 
 use anyhow::Result;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use chrono::{Duration, Utc};
 use otter_core::config::AppConfig;
 use otter_core::db::Database;
 use otter_core::domain::{
@@ -14,6 +17,7 @@ use otter_core::domain::{
 };
 use otter_core::queue::RedisQueue;
 use otter_core::service::OtterService;
+use tokio::time::Duration as TokioDuration;
 use tracing::info;
 use uuid::Uuid;
 
@@ -63,6 +67,7 @@ async fn main() -> Result<()> {
         .route("/v1/prompts", post(enqueue_prompt))
         .route("/v1/jobs/{id}", get(get_job))
         .route("/v1/jobs/{id}/events", get(get_job_events))
+        .route("/v1/events/stream", get(stream_job_events))
         .route("/v1/jobs/{id}/cancel", post(cancel_job))
         .route("/v1/queue", get(get_queue))
         .route(
@@ -213,6 +218,31 @@ async fn get_queue(
         .await
         .map_err(internal_error)?;
     Ok(Json(items))
+}
+
+async fn stream_job_events(
+    State(state): State<AppState>,
+) -> Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>> {
+    let stream = async_stream::stream! {
+        let mut since = Utc::now() - Duration::seconds(5);
+        loop {
+            let events = state
+                .service
+                .fetch_job_events_since(since, 200)
+                .await
+                .unwrap_or_default();
+
+            for event in events {
+                since = event.created_at;
+                let payload = serde_json::to_string(&event).unwrap_or_else(|_| "{}".to_string());
+                yield Ok(Event::default().event(event.event_type.clone()).data(payload));
+            }
+
+            tokio::time::sleep(TokioDuration::from_secs(1)).await;
+        }
+    };
+
+    Sse::new(stream).keep_alive(KeepAlive::new().interval(TokioDuration::from_secs(10)))
 }
 
 async fn update_queue_position(

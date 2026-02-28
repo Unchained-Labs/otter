@@ -212,6 +212,14 @@ impl<Q: Queue> OtterService<Q> {
         self.db.list_job_events(job_id).await
     }
 
+    pub async fn fetch_job_events_since(
+        &self,
+        since: chrono::DateTime<chrono::Utc>,
+        limit: i64,
+    ) -> Result<Vec<JobEvent>> {
+        self.db.list_job_events_since(since, limit).await
+    }
+
     pub async fn cancel_job(&self, job_id: Uuid) -> Result<bool> {
         let result = self.db.mark_job_cancelled(job_id).await?;
         if result.rows_affected() > 0 {

@@ -212,6 +212,27 @@ impl Database {
         Ok(events)
     }
 
+    pub async fn list_job_events_since(
+        &self,
+        since: chrono::DateTime<chrono::Utc>,
+        limit: i64,
+    ) -> Result<Vec<JobEvent>> {
+        let events = sqlx::query_as::<_, JobEvent>(
+            r#"
+            SELECT id, job_id, event_type, payload, created_at
+            FROM job_events
+            WHERE created_at > $1
+            ORDER BY created_at ASC
+            LIMIT $2
+            "#,
+        )
+        .bind(since)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(events)
+    }
+
     pub async fn insert_job_event(
         &self,
         job_id: Uuid,
