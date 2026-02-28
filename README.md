@@ -31,6 +31,14 @@ Install Mistral Vibe on host and bootstrap host `~/.vibe`:
 ./scripts/bootstrap_host_vibe_home.sh
 ```
 
+Use the local endpoint CLI for quick API tests:
+
+```bash
+./scripts/otter-cli.sh smoke
+./scripts/otter-cli.sh projects list
+./scripts/otter-cli.sh queue list 20 0
+```
+
 ```bash
 docker compose up --build
 ```
