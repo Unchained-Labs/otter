@@ -1,0 +1,7 @@
+target/
+.env
+.env.*
+
+vendor/*
+!vendor/home/
+!vendor/home/**
