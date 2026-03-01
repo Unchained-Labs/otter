@@ -17,6 +17,7 @@ It accepts prompts through HTTP endpoints, queues and schedules work, executes `
 - Isolated per-workspace `VIBE_HOME` trust model.
 - Streaming execution chunks (`output_chunk`) via SSE.
 - Post-run `setup.sh` hook execution with streamed logs.
+- Vibe programmatic mode uses `--output streaming` for pseudo-live frontend feedback.
 - Workspace filesystem APIs (`tree` / `file`) for frontend explorer UX.
 - Request tracing + lifecycle logs for operations visibility.
 - Dockerized runtime with Compose stack for local and NUC deployment.
@@ -154,8 +155,11 @@ Otter composes a system prompt that enforces safe and repeatable project executi
 
 - Always work in a dedicated project subfolder under workspace.
 - Install dependencies before run/build.
+- Generate a production-ready Dockerfile at project root.
+- Build and run the generated app inside Docker as the primary execution path.
 - Generate an executable `setup.sh` at project root.
 - Start the generated app/service in background.
 - Print clear run/stop instructions and project location.
+- Include app access information (URL and host port) in the final output.
 
 After a successful vibe execution, Otter attempts to run `setup.sh` and streams its output back as `output_chunk` events.
