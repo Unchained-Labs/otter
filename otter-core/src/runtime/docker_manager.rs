@@ -11,8 +11,8 @@ use bollard::exec::{CreateExecOptions, StartExecOptions, StartExecResults};
 use bollard::image::BuildImageOptions;
 use bollard::models::{HostConfig, PortBinding};
 use bollard::{Docker, API_DEFAULT_VERSION};
-use bytes::Bytes;
 use futures_util::stream::{StreamExt, TryStreamExt};
+use hyper::body::Body;
 use tar::Builder;
 use tracing::debug;
 use uuid::Uuid;
@@ -326,7 +326,7 @@ impl DockerRuntimeManager {
             ..Default::default()
         };
 
-        let body = hyper::Body::from(context);
+        let body = Body::from(context);
         let mut stream = self.docker.build_image(options, None, Some(body));
         while let Some(chunk) = stream
             .try_next()
