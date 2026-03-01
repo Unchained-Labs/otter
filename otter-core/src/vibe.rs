@@ -194,6 +194,7 @@ fn compose_vibe_prompt(user_prompt: &str) -> String {
 - Ensure dependencies are installed before running/building (detect toolchain and install accordingly: npm/pnpm/yarn, pip/uv/poetry, cargo, etc.).
 - When implementation is complete, start the app/service in background and verify it runs.
 - At the end, print clear run instructions: start command, stop command, and where the project lives.
+- Always run the app/service in the background. Give the link to the project in the output.
 
 USER TASK:
 {user_prompt}"#
