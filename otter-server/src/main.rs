@@ -1,4 +1,6 @@
 use std::convert::Infallible;
+use std::fs;
+use std::path::{Path as FsPath, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -14,7 +16,7 @@ use otter_core::config::AppConfig;
 use otter_core::db::Database;
 use otter_core::domain::{
     CreateProjectRequest, CreateWorkspaceRequest, EnqueuePromptRequest, Job, JobEvent, JobOutput,
-    QueueItem, UpdateQueuePositionRequest,
+    QueueItem, UpdateQueuePositionRequest, Workspace,
 };
 use otter_core::queue::RedisQueue;
 use otter_core::service::OtterService;
@@ -37,6 +39,41 @@ struct HistoryQuery {
 struct QueueQuery {
     limit: Option<i64>,
     offset: Option<i64>,
+}
+
+#[derive(serde::Deserialize)]
+struct WorkspaceTreeQuery {
+    path: Option<String>,
+    depth: Option<usize>,
+}
+
+#[derive(serde::Deserialize)]
+struct WorkspaceFileQuery {
+    path: String,
+}
+
+#[derive(serde::Serialize)]
+struct WorkspaceTreeEntryResponse {
+    name: String,
+    relative_path: String,
+    kind: String,
+    size_bytes: Option<u64>,
+}
+
+#[derive(serde::Serialize)]
+struct WorkspaceTreeResponse {
+    workspace_id: Uuid,
+    root_path: String,
+    base_path: String,
+    entries: Vec<WorkspaceTreeEntryResponse>,
+}
+
+#[derive(serde::Serialize)]
+struct WorkspaceFileResponse {
+    workspace_id: Uuid,
+    relative_path: String,
+    content: String,
+    truncated: bool,
 }
 
 #[derive(serde::Serialize)]
@@ -81,6 +118,8 @@ async fn main() -> Result<()> {
             "/v1/workspaces",
             post(create_workspace).get(list_workspaces),
         )
+        .route("/v1/workspaces/{id}/tree", get(get_workspace_tree))
+        .route("/v1/workspaces/{id}/file", get(get_workspace_file))
         .route("/v1/prompts", post(enqueue_prompt))
         .route("/v1/jobs/{id}", get(get_job))
         .route("/v1/jobs/{id}/events", get(get_job_events))
@@ -149,6 +188,63 @@ async fn list_workspaces(
         .await
         .map(Json)
         .map_err(internal_error)
+}
+
+async fn get_workspace_tree(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Query(query): Query<WorkspaceTreeQuery>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let workspace = state
+        .service
+        .db
+        .fetch_workspace(id)
+        .await
+        .map_err(internal_error)?
+        .ok_or((StatusCode::NOT_FOUND, "workspace not found".to_string()))?;
+    let depth = query.depth.unwrap_or(2).min(5);
+    let base = resolve_workspace_subpath(&workspace, query.path.as_deref().unwrap_or(""))?;
+    let root = canonicalize_workspace_root(&workspace)?;
+    let mut entries = Vec::new();
+    list_workspace_entries(&root, &base, depth, &mut entries).map_err(internal_error)?;
+    Ok(Json(WorkspaceTreeResponse {
+        workspace_id: id,
+        root_path: workspace.root_path,
+        base_path: query.path.unwrap_or_default(),
+        entries,
+    }))
+}
+
+async fn get_workspace_file(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Query(query): Query<WorkspaceFileQuery>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let workspace = state
+        .service
+        .db
+        .fetch_workspace(id)
+        .await
+        .map_err(internal_error)?
+        .ok_or((StatusCode::NOT_FOUND, "workspace not found".to_string()))?;
+    let file_path = resolve_workspace_subpath(&workspace, &query.path)?;
+    let metadata = fs::metadata(&file_path).map_err(internal_error)?;
+    if metadata.is_dir() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "path points to a directory".to_string(),
+        ));
+    }
+    let bytes = fs::read(&file_path).map_err(internal_error)?;
+    let max_bytes = 200_000usize;
+    let truncated = bytes.len() > max_bytes;
+    let content = String::from_utf8_lossy(&bytes[..bytes.len().min(max_bytes)]).to_string();
+    Ok(Json(WorkspaceFileResponse {
+        workspace_id: id,
+        relative_path: query.path,
+        content,
+        truncated,
+    }))
 }
 
 async fn enqueue_prompt(
@@ -281,4 +377,72 @@ async fn update_queue_position(
 
 fn internal_error(error: impl std::fmt::Display) -> (StatusCode, String) {
     (StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
+}
+
+fn canonicalize_workspace_root(workspace: &Workspace) -> Result<PathBuf, (StatusCode, String)> {
+    let root = fs::canonicalize(&workspace.root_path)
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    Ok(root)
+}
+
+fn resolve_workspace_subpath(
+    workspace: &Workspace,
+    relative_path: &str,
+) -> Result<PathBuf, (StatusCode, String)> {
+    let root = canonicalize_workspace_root(workspace)?;
+    if relative_path.is_empty() {
+        return Ok(root);
+    }
+    let candidate = root.join(relative_path);
+    let canonical = fs::canonicalize(&candidate)
+        .map_err(|_| (StatusCode::NOT_FOUND, "path not found".to_string()))?;
+    if !canonical.starts_with(&root) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "path escapes workspace root".to_string(),
+        ));
+    }
+    Ok(canonical)
+}
+
+fn list_workspace_entries(
+    root: &FsPath,
+    current: &FsPath,
+    depth: usize,
+    entries: &mut Vec<WorkspaceTreeEntryResponse>,
+) -> Result<()> {
+    if depth == 0 {
+        return Ok(());
+    }
+    let dir = fs::read_dir(current)?;
+    let mut children = dir.filter_map(|entry| entry.ok()).collect::<Vec<_>>();
+    children.sort_by_key(|entry| entry.path());
+    for child in children {
+        let path = child.path();
+        let metadata = child.metadata()?;
+        let kind = if metadata.is_dir() {
+            "directory"
+        } else {
+            "file"
+        };
+        let relative = path
+            .strip_prefix(root)
+            .unwrap_or(path.as_path())
+            .to_string_lossy()
+            .to_string();
+        entries.push(WorkspaceTreeEntryResponse {
+            name: child.file_name().to_string_lossy().to_string(),
+            relative_path: relative.clone(),
+            kind: kind.to_string(),
+            size_bytes: if metadata.is_file() {
+                Some(metadata.len())
+            } else {
+                None
+            },
+        });
+        if metadata.is_dir() {
+            list_workspace_entries(root, &path, depth - 1, entries)?;
+        }
+    }
+    Ok(())
 }
