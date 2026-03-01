@@ -21,7 +21,7 @@ use otter_core::domain::{
 use otter_core::queue::RedisQueue;
 use otter_core::service::OtterService;
 use tokio::time::Duration as TokioDuration;
-use tower_http::cors::{AllowOrigin, CorsLayer};
+use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use tower_http::trace::{DefaultOnResponse, TraceLayer};
 use tracing::{info, Level};
 use uuid::Uuid;
@@ -97,20 +97,27 @@ async fn main() -> Result<()> {
     let service = Arc::new(OtterService::new(&config, database, queue));
     let state = AppState { service };
 
-    let allowed_origins = config
+    let allow_any_origin = config
         .cors_allowed_origins
         .iter()
-        .map(|origin| origin.parse::<HeaderValue>())
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    let cors = CorsLayer::new()
-        .allow_origin(AllowOrigin::list(allowed_origins))
-        .allow_methods([
-            axum::http::Method::GET,
-            axum::http::Method::POST,
-            axum::http::Method::PATCH,
-            axum::http::Method::OPTIONS,
-        ])
-        .allow_headers(tower_http::cors::Any);
+        .any(|origin| origin == "*");
+    let cors = if allow_any_origin {
+        CorsLayer::new().allow_origin(Any)
+    } else {
+        let allowed_origins = config
+            .cors_allowed_origins
+            .iter()
+            .map(|origin| origin.parse::<HeaderValue>())
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        CorsLayer::new().allow_origin(AllowOrigin::list(allowed_origins))
+    }
+    .allow_methods([
+        axum::http::Method::GET,
+        axum::http::Method::POST,
+        axum::http::Method::PATCH,
+        axum::http::Method::OPTIONS,
+    ])
+    .allow_headers(tower_http::cors::Any);
 
     let app = Router::new()
         .route("/healthz", get(healthz))

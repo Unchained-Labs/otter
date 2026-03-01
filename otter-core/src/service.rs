@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use std::{fs, path::Path};
@@ -115,8 +116,8 @@ impl<Q: Queue> OtterService<Q> {
             .insert_job_event(job.id, "queued", serde_json::json!({}))
             .await?;
         info!(
-            %workspace_id,
             job_id = %job.id,
+            workspace_id = %workspace_id,
             priority = job.priority,
             "job accepted and queued"
         );
@@ -264,8 +265,9 @@ impl<Q: Queue> OtterService<Q> {
             sleep(Duration::from_millis(250)).await;
             return Ok(None);
         };
-        info!(job_id = %message.job_id, "dequeued job from redis queue");
+        info!(job_id = %message.job_id, "dequeued job message from redis");
         let Some(job) = self.db.claim_queued_job_by_id(message.job_id).await? else {
+            warn!(job_id = %message.job_id, "dequeued message could not claim queued job");
             if let Some(job_state) = self.db.fetch_job(message.job_id).await? {
                 let should_requeue_for_schedule = matches!(job_state.status, JobStatus::Queued)
                     && job_state
@@ -273,6 +275,7 @@ impl<Q: Queue> OtterService<Q> {
                         .map(|at| at > Utc::now())
                         .unwrap_or(false);
                 if should_requeue_for_schedule {
+                    info!(job_id = %message.job_id, "job scheduled in future; requeued message");
                     self.queue
                         .enqueue(
                             DEFAULT_QUEUE_NAME,
@@ -301,6 +304,13 @@ impl<Q: Queue> OtterService<Q> {
         self.db
             .insert_job_event(job.id, "started", serde_json::json!({}))
             .await?;
+        info!(
+            job_id = %job.id,
+            workspace_id = %job.workspace_id,
+            attempt = job.attempts + 1,
+            max_attempts = job.max_attempts,
+            "job claimed and started"
+        );
 
         if let Err(error) = self.execute_job(&job).await {
             let error_message = error.to_string();
@@ -310,6 +320,13 @@ impl<Q: Queue> OtterService<Q> {
                     .set_job_back_to_queue(job.id, error_message.clone())
                     .await?;
                 if requeued {
+                    warn!(
+                        job_id = %job.id,
+                        attempt = job.attempts + 1,
+                        max_attempts = job.max_attempts,
+                        error = %error_message,
+                        "job failed and was requeued"
+                    );
                     self.queue
                         .enqueue(DEFAULT_QUEUE_NAME, &QueueMessage { job_id: job.id })
                         .await?;
@@ -331,6 +348,12 @@ impl<Q: Queue> OtterService<Q> {
             } else {
                 let failed = self.db.fail_job(job.id, error_message.clone()).await?;
                 if failed {
+                    warn!(
+                        job_id = %job.id,
+                        attempts = job.attempts + 1,
+                        error = %error_message,
+                        "job failed terminally"
+                    );
                     self.db
                         .insert_job_event(
                             job.id,
@@ -360,6 +383,16 @@ impl<Q: Queue> OtterService<Q> {
             .ok_or_else(|| anyhow!("workspace not found: {}", job.workspace_id))?;
         let workspace_path = PathBuf::from(&workspace.root_path);
         let isolated_vibe_home = PathBuf::from(&workspace.isolated_vibe_home);
+        let output_chunk_count = Arc::new(AtomicUsize::new(0));
+        let chunk_counter = output_chunk_count.clone();
+
+        info!(
+            job_id = %job.id,
+            workspace_id = %workspace.id,
+            workspace_root = %workspace.root_path,
+            isolated_vibe_home = %workspace.isolated_vibe_home,
+            "executing vibe prompt"
+        );
 
         let result = self
             .vibe_executor
@@ -367,21 +400,31 @@ impl<Q: Queue> OtterService<Q> {
                 &job.prompt,
                 &workspace_path,
                 &isolated_vibe_home,
-                |chunk: VibeOutputChunk| async move {
-                    self.db
-                        .insert_job_event(
-                            job.id,
-                            "output_chunk",
-                            serde_json::json!({
-                                "stream": chunk.stream,
-                                "line": chunk.line
-                            }),
-                        )
-                        .await?;
-                    Ok(())
+                |chunk: VibeOutputChunk| {
+                    let chunk_counter = chunk_counter.clone();
+                    async move {
+                        chunk_counter.fetch_add(1, Ordering::Relaxed);
+                        self.db
+                            .insert_job_event(
+                                job.id,
+                                "output_chunk",
+                                serde_json::json!({
+                                    "stream": chunk.stream,
+                                    "line": chunk.line
+                                }),
+                            )
+                            .await?;
+                        Ok(())
+                    }
                 },
             )
             .await?;
+        info!(
+            job_id = %job.id,
+            exit_code = result.exit_code,
+            output_chunks = output_chunk_count.load(Ordering::Relaxed),
+            "vibe execution finished"
+        );
 
         let completed = self
             .db

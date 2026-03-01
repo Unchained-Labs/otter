@@ -43,10 +43,24 @@ async fn main() -> Result<()> {
 }
 
 async fn worker_loop(worker_id: usize, service: Arc<OtterService<RedisQueue>>) {
+    let mut idle_ticks: u32 = 0;
     loop {
         match service.process_next_job().await {
-            Ok(Some(job_id)) => info!(%job_id, worker_id, "processed queue job"),
-            Ok(None) => sleep(Duration::from_secs(1)).await,
+            Ok(Some(job_id)) => {
+                idle_ticks = 0;
+                info!(%job_id, worker_id, "processed queue job");
+            }
+            Ok(None) => {
+                idle_ticks = idle_ticks.saturating_add(1);
+                if idle_ticks % 30 == 0 {
+                    info!(
+                        worker_id,
+                        idle_seconds = idle_ticks,
+                        "worker idle; waiting for jobs"
+                    );
+                }
+                sleep(Duration::from_secs(1)).await
+            }
             Err(err) => {
                 error!(error = %err, worker_id, "worker loop error");
                 sleep(Duration::from_secs(2)).await;
