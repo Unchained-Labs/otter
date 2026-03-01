@@ -117,3 +117,29 @@ pub struct QueueItem {
     pub queue_rank: i64,
     pub created_at: DateTime<Utc>,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeContainerStatus {
+    Running,
+    Stopped,
+    Missing,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuntimePortBinding {
+    pub container_port: u16,
+    pub host_ip: String,
+    pub host_port: u16,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuntimeContainerInfo {
+    pub workspace_id: Uuid,
+    pub container_name: String,
+    pub image_tag: String,
+    pub container_id: Option<String>,
+    pub status: RuntimeContainerStatus,
+    pub ports: Vec<RuntimePortBinding>,
+    pub preferred_url: Option<String>,
+}

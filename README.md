@@ -71,6 +71,13 @@ curl http://localhost:8080/healthz
 - `OTTER_MAX_ATTEMPTS` (default `5`)
 - `OTTER_WORKER_CONCURRENCY` (default `1`)
 - `OTTER_ALLOWED_ROOTS` (optional `:`-separated allowlist)
+- `OTTER_RUNTIME_ENABLED` (default `false`, enables sibling container runtime)
+- `OTTER_RUNTIME_DOCKER_SOCKET` (default `unix:///var/run/docker.sock`)
+- `OTTER_RUNTIME_NETWORK` (default `kymatics_default`)
+- `OTTER_RUNTIME_CONTAINER_PREFIX` (default `otter-ws`)
+- `OTTER_RUNTIME_IMAGE_PREFIX` (default `otter/workspace`)
+- `OTTER_RUNTIME_DEFAULT_HOST` (default `http://localhost`, used to compose preview URLs)
+- `OTTER_RUNTIME_MAX_LOG_LINES` (default `2000`)
 - `MISTRAL_API_KEY` (read from `.env`, passed to server/worker/vibe process)
 
 ### Selecting a Vibe model
@@ -98,6 +105,10 @@ These are forwarded as `VIBE_MODEL` / `MISTRAL_MODEL` and `VIBE_PROVIDER` for co
 - `GET /v1/queue`
 - `PATCH /v1/queue/{id}` (update queue position via priority)
 - `GET /v1/history`
+- `GET /v1/runtime/workspaces/{id}` (runtime container status + preferred preview URL)
+- `POST /v1/runtime/workspaces/{id}/start|stop|restart`
+- `GET /v1/runtime/workspaces/{id}/logs?tail=200`
+- `GET /v1/runtime/workspaces/{id}/shell/ws` (interactive command channel via websocket)
 
 ## Repository Structure
 

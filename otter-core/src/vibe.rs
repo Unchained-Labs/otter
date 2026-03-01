@@ -223,8 +223,6 @@ fn compose_vibe_prompt(user_prompt: &str) -> String {
 - Always create a production-ready Dockerfile at the project root and use it as the primary run path.
 - Build and run the generated app/service inside Docker (do not run directly on host process as the main path).
 - Verify the container is running and expose the app on a reachable port from the current environment.
-- Always create a setup script named `setup.sh` at the project root that installs and configures everything needed to run the project.
-- Ensure `setup.sh` is executable (`chmod +x setup.sh`) and deterministic/idempotent (safe to run multiple times).
 - When implementation is complete, start the app/service in background and verify it runs.
 - At the end, print clear run instructions: docker build command, docker run command, docker stop/remove command, and where the project lives.
 - Always include where to access the running app (URL/host port) in the final output.
