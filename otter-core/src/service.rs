@@ -31,6 +31,7 @@ pub struct OtterService<Q: Queue> {
     pub vibe_executor: Arc<VibeExecutor>,
     pub max_attempts: i32,
     pub default_workspace_path: Option<PathBuf>,
+    pub default_workspace_subdir: String,
 }
 
 impl<Q: Queue> OtterService<Q> {
@@ -52,6 +53,7 @@ impl<Q: Queue> OtterService<Q> {
             vibe_executor: Arc::new(VibeExecutor::new(config.vibe_bin.clone())),
             max_attempts: config.max_attempts,
             default_workspace_path: config.default_workspace_path.clone(),
+            default_workspace_subdir: config.default_workspace_subdir.clone(),
         }
     }
 
@@ -92,10 +94,9 @@ impl<Q: Queue> OtterService<Q> {
 
     pub async fn enqueue_prompt(&self, request: EnqueuePromptRequest) -> Result<Job> {
         request.validate()?;
-        let workspace_id = match request.workspace_id {
-            Some(workspace_id) => workspace_id,
-            None => self.resolve_default_workspace_id().await?,
-        };
+        let workspace_id = self
+            .resolve_workspace_id_or_default(request.workspace_id)
+            .await?;
         let job = self
             .db
             .create_job(
@@ -128,9 +129,14 @@ impl<Q: Queue> OtterService<Q> {
         let fallback_path = self.default_workspace_path.as_ref().ok_or_else(|| {
             anyhow!("workspace_id is required when OTTER_DEFAULT_WORKSPACE_PATH is not configured")
         })?;
-        let canonical = self
+        let canonical_root = self
             .workspace_manager
             .validate_workspace_path(fallback_path.as_path())?;
+        let target_path = canonical_root.join(&self.default_workspace_subdir);
+        fs::create_dir_all(&target_path)?;
+        let canonical = self
+            .workspace_manager
+            .validate_workspace_path(&target_path)?;
         let root_path = canonical.to_string_lossy().to_string();
 
         if let Some(existing) = self.db.find_workspace_by_root_path(&root_path).await? {
@@ -176,6 +182,16 @@ impl<Q: Queue> OtterService<Q> {
             .await?;
 
         Ok(workspace.id)
+    }
+
+    pub async fn resolve_workspace_id_or_default(
+        &self,
+        workspace_id: Option<Uuid>,
+    ) -> Result<Uuid> {
+        match workspace_id {
+            Some(id) => Ok(id),
+            None => self.resolve_default_workspace_id().await,
+        }
     }
 
     async fn sync_workspace_directories_from_default_root(&self) -> Result<()> {
