@@ -1,6 +1,7 @@
 use std::convert::Infallible;
 use std::fs;
 use std::path::{Path as FsPath, PathBuf};
+use std::process::Stdio;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -20,10 +21,11 @@ use otter_core::domain::{
 };
 use otter_core::queue::RedisQueue;
 use otter_core::service::OtterService;
+use tokio::process::Command;
 use tokio::time::Duration as TokioDuration;
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use tower_http::trace::{DefaultOnResponse, TraceLayer};
-use tracing::{info, Level};
+use tracing::{info, warn, Level};
 use uuid::Uuid;
 
 #[derive(Clone)]
@@ -53,6 +55,13 @@ struct WorkspaceFileQuery {
     path: String,
 }
 
+#[derive(serde::Deserialize)]
+struct WorkspaceCommandRequest {
+    command: String,
+    working_directory: Option<String>,
+    timeout_seconds: Option<u64>,
+}
+
 #[derive(serde::Serialize)]
 struct WorkspaceTreeEntryResponse {
     name: String,
@@ -75,6 +84,17 @@ struct WorkspaceFileResponse {
     relative_path: String,
     content: String,
     truncated: bool,
+}
+
+#[derive(serde::Serialize)]
+struct WorkspaceCommandResponse {
+    workspace_id: Uuid,
+    command: String,
+    working_directory: String,
+    exit_code: Option<i32>,
+    stdout: String,
+    stderr: String,
+    timed_out: bool,
 }
 
 #[derive(serde::Serialize)]
@@ -128,6 +148,7 @@ async fn main() -> Result<()> {
         )
         .route("/v1/workspaces/{id}/tree", get(get_workspace_tree))
         .route("/v1/workspaces/{id}/file", get(get_workspace_file))
+        .route("/v1/workspaces/{id}/command", post(run_workspace_command))
         .route("/v1/prompts", post(enqueue_prompt))
         .route("/v1/jobs/{id}", get(get_job))
         .route("/v1/jobs/{id}/events", get(get_job_events))
@@ -253,6 +274,73 @@ async fn get_workspace_file(
         relative_path: query.path,
         content,
         truncated,
+    }))
+}
+
+async fn run_workspace_command(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(body): Json<WorkspaceCommandRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    if body.command.trim().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "command must not be empty".to_string(),
+        ));
+    }
+
+    let workspace = state
+        .service
+        .db
+        .fetch_workspace(id)
+        .await
+        .map_err(internal_error)?
+        .ok_or((StatusCode::NOT_FOUND, "workspace not found".to_string()))?;
+
+    let cwd =
+        resolve_workspace_subpath(&workspace, body.working_directory.as_deref().unwrap_or(""))?;
+    let timeout_seconds = body.timeout_seconds.unwrap_or(30).clamp(1, 300);
+
+    info!(
+        workspace_id = %id,
+        cwd = %cwd.display(),
+        timeout_seconds,
+        command = %body.command,
+        "running workspace shell command"
+    );
+
+    let output = Command::new("timeout")
+        .arg(format!("{timeout_seconds}s"))
+        .arg("bash")
+        .arg("-lc")
+        .arg(&body.command)
+        .current_dir(&cwd)
+        .env("VIBE_HOME", &workspace.isolated_vibe_home)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await
+        .map_err(internal_error)?;
+
+    let timed_out = output.status.code() == Some(124);
+    if timed_out {
+        warn!(
+            workspace_id = %id,
+            cwd = %cwd.display(),
+            timeout_seconds,
+            command = %body.command,
+            "workspace shell command timed out"
+        );
+    }
+
+    Ok(Json(WorkspaceCommandResponse {
+        workspace_id: id,
+        command: body.command,
+        working_directory: cwd.display().to_string(),
+        exit_code: output.status.code(),
+        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+        timed_out,
     }))
 }
 
