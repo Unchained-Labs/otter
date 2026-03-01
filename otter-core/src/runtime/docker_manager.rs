@@ -314,9 +314,9 @@ impl DockerRuntimeManager {
             .rm(true)
             .build();
 
-        let mut stream = self
-            .docker
-            .build_image(options, None, Some(body_full(Bytes::from(context))));
+        let mut stream =
+            self.docker
+                .build_image(options, None, Some(body_full(Bytes::from(context))));
         while let Some(chunk) = stream
             .try_next()
             .await
@@ -345,19 +345,15 @@ impl DockerRuntimeManager {
             .await
         {
             Ok(response) => Ok(Some(response)),
-            Err(bollard::errors::Error::DockerResponseServerError { status_code, .. })
-                if status_code == 404 =>
-            {
-                Ok(None)
-            }
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404, ..
+            }) => Ok(None),
             Err(error) => Err(error.into()),
         }
     }
 
     pub async fn prune_stale_containers(&self) -> Result<()> {
-        let list_opts = ListContainersOptionsBuilder::default()
-            .all(true)
-            .build();
+        let list_opts = ListContainersOptionsBuilder::default().all(true).build();
         let containers = self.docker.list_containers(Some(list_opts)).await?;
         for container in containers {
             let Some(names) = container.names else {
@@ -375,10 +371,7 @@ impl DockerRuntimeManager {
                     .force(true)
                     .v(true)
                     .build();
-                let _ = self
-                    .docker
-                    .remove_container(&id, Some(remove_opts))
-                    .await;
+                let _ = self.docker.remove_container(&id, Some(remove_opts)).await;
             }
         }
         Ok(())

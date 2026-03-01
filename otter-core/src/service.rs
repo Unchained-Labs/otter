@@ -842,7 +842,10 @@ impl<Q: Queue> OtterService<Q> {
                             .await?
                             .ok_or_else(|| anyhow!("workspace not found: {workspace_id}"))?;
                         runtime
-                            .ensure_workspace_container(workspace_id, Path::new(&workspace.root_path))
+                            .ensure_workspace_container(
+                                workspace_id,
+                                Path::new(&workspace.root_path),
+                            )
                             .await?;
                         // New container starts from default cwd; clear any stale cwd from prior session.
                         let mut sessions = self.runtime_shell_cwds.lock().await;
