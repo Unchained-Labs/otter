@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::process::Stdio;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -6,6 +7,8 @@ use std::{fs, path::Path};
 
 use anyhow::{anyhow, Result};
 use chrono::Utc;
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::process::Command;
 use tokio::time::sleep;
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -50,7 +53,12 @@ impl<Q: Queue> OtterService<Q> {
                 allowed_roots,
                 config.vibe_base_home.clone(),
             )),
-            vibe_executor: Arc::new(VibeExecutor::new(config.vibe_bin.clone())),
+            vibe_executor: Arc::new(VibeExecutor::new(
+                config.vibe_bin.clone(),
+                config.vibe_model.clone(),
+                config.vibe_provider.clone(),
+                config.vibe_extra_env.clone(),
+            )),
             max_attempts: config.max_attempts,
             default_workspace_path: config.default_workspace_path.clone(),
             default_workspace_subdir: config.default_workspace_subdir.clone(),
@@ -442,6 +450,15 @@ impl<Q: Queue> OtterService<Q> {
             "vibe execution finished"
         );
 
+        let setup_line_count = self
+            .run_setup_script_with_streaming(job.id, &workspace_path)
+            .await?;
+        info!(
+            job_id = %job.id,
+            setup_lines = setup_line_count,
+            "setup.sh execution finished"
+        );
+
         let completed = self
             .db
             .complete_job(
@@ -475,6 +492,142 @@ impl<Q: Queue> OtterService<Q> {
             "job completed successfully"
         );
         Ok(())
+    }
+
+    async fn run_setup_script_with_streaming(
+        &self,
+        job_id: Uuid,
+        workspace_path: &Path,
+    ) -> Result<usize> {
+        let setup_path = workspace_path.join("setup.sh");
+        if !setup_path.exists() {
+            return Err(anyhow!(
+                "setup.sh was not generated in project root ({})",
+                setup_path.display()
+            ));
+        }
+
+        self.db
+            .insert_job_event(
+                job_id,
+                "output_chunk",
+                serde_json::json!({
+                    "stream": "stdout",
+                    "line": "[setup] starting ./setup.sh"
+                }),
+            )
+            .await?;
+
+        let mut child = Command::new("bash")
+            .arg("-lc")
+            .arg("chmod +x setup.sh && ./setup.sh")
+            .current_dir(workspace_path)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow!("missing setup stdout pipe"))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| anyhow!("missing setup stderr pipe"))?;
+
+        let mut stdout_lines = BufReader::new(stdout).lines();
+        let mut stderr_lines = BufReader::new(stderr).lines();
+        let mut line_count: usize = 0;
+
+        loop {
+            tokio::select! {
+                line = stdout_lines.next_line() => {
+                    match line? {
+                        Some(line) => {
+                            line_count += 1;
+                            self.db
+                                .insert_job_event(
+                                    job_id,
+                                    "output_chunk",
+                                    serde_json::json!({
+                                        "stream": "stdout",
+                                        "line": format!("[setup] {line}")
+                                    }),
+                                )
+                                .await?;
+                        }
+                        None => break,
+                    }
+                }
+                line = stderr_lines.next_line() => {
+                    match line? {
+                        Some(line) => {
+                            line_count += 1;
+                            self.db
+                                .insert_job_event(
+                                    job_id,
+                                    "output_chunk",
+                                    serde_json::json!({
+                                        "stream": "stderr",
+                                        "line": format!("[setup] {line}")
+                                    }),
+                                )
+                                .await?;
+                        }
+                        None => break,
+                    }
+                }
+            }
+        }
+
+        // Flush any remaining lines from either stream.
+        while let Some(line) = stdout_lines.next_line().await? {
+            line_count += 1;
+            self.db
+                .insert_job_event(
+                    job_id,
+                    "output_chunk",
+                    serde_json::json!({
+                        "stream": "stdout",
+                        "line": format!("[setup] {line}")
+                    }),
+                )
+                .await?;
+        }
+        while let Some(line) = stderr_lines.next_line().await? {
+            line_count += 1;
+            self.db
+                .insert_job_event(
+                    job_id,
+                    "output_chunk",
+                    serde_json::json!({
+                        "stream": "stderr",
+                        "line": format!("[setup] {line}")
+                    }),
+                )
+                .await?;
+        }
+
+        let status = child.wait().await?;
+        if !status.success() {
+            return Err(anyhow!(
+                "setup.sh exited with code {}",
+                status.code().unwrap_or(-1)
+            ));
+        }
+
+        self.db
+            .insert_job_event(
+                job_id,
+                "output_chunk",
+                serde_json::json!({
+                    "stream": "stdout",
+                    "line": "[setup] completed successfully"
+                }),
+            )
+            .await?;
+
+        Ok(line_count)
     }
 
     pub async fn fetch_job(&self, job_id: Uuid) -> Result<Option<Job>> {
