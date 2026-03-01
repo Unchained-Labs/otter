@@ -75,9 +75,20 @@ Base URL: `http://<host>:8080`
 ## Jobs
 
 - `GET /v1/jobs/{id}`
-  - Returns job metadata, latest output payload if available, and `queue_rank` while queued.
+  - Returns job metadata (including `is_paused` and optional `preview_url`), latest output payload if available, and `queue_rank` while queued.
 - `POST /v1/jobs/{id}/cancel`
   - Cancels queued/running jobs.
+- `POST /v1/jobs/{id}/pause`
+  - Pauses a queued job so it remains queued but not runnable by workers.
+- `POST /v1/jobs/{id}/resume`
+  - Resumes a paused queued job and re-enqueues it for execution.
+- `POST /v1/jobs/{id}/preview-url`
+  - Sets a demo URL for job browser preview.
+  - Body:
+    ```json
+    { "preview_url": "http://host:port" }
+    ```
+  - URL must be absolute and use `http` or `https`.
 - `GET /v1/jobs/{id}/events`
   - Returns ordered lifecycle events.
 - `GET /v1/events/stream`
@@ -104,3 +115,4 @@ Base URL: `http://<host>:8080`
 
 - HTTP request tracing is enabled server-side (status + latency).
 - Job lifecycle logs are emitted by worker/service layers for enqueue/claim/retry/fail/complete states.
+- Runtime shell commands auto-recover when workspace container is missing/stopped before falling back to host workspace shell execution.

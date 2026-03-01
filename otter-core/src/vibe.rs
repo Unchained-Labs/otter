@@ -7,10 +7,12 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::mpsc;
+use tokio::time::{interval, Duration, MissedTickBehavior};
 
 #[derive(Debug, Clone)]
 pub struct VibeExecutor {
     pub vibe_bin: String,
+    pub otter_api_base_url: String,
     pub vibe_model: Option<String>,
     pub vibe_provider: Option<String>,
     pub vibe_extra_env: Vec<(String, String)>,
@@ -40,12 +42,14 @@ pub struct VibeOutputChunk {
 impl VibeExecutor {
     pub fn new(
         vibe_bin: String,
+        otter_api_base_url: String,
         vibe_model: Option<String>,
         vibe_provider: Option<String>,
         vibe_extra_env: Vec<(String, String)>,
     ) -> Self {
         Self {
             vibe_bin,
+            otter_api_base_url,
             vibe_model,
             vibe_provider,
             vibe_extra_env,
@@ -69,10 +73,11 @@ impl VibeExecutor {
     pub async fn run_prompt(
         &self,
         prompt: &str,
+        job_id: uuid::Uuid,
         workspace_path: &Path,
         isolated_vibe_home: &Path,
     ) -> Result<VibeExecutionResult> {
-        let effective_prompt = compose_vibe_prompt(prompt);
+        let effective_prompt = compose_vibe_prompt(prompt, job_id, &self.otter_api_base_url);
         let mut cmd = Command::new(&self.vibe_bin);
         cmd.arg("--prompt")
             .arg(&effective_prompt)
@@ -108,18 +113,22 @@ impl VibeExecutor {
         })
     }
 
-    pub async fn run_prompt_streaming<F, Fut>(
+    pub async fn run_prompt_streaming<F, Fut, C, CFut>(
         &self,
         prompt: &str,
+        job_id: uuid::Uuid,
         workspace_path: &Path,
         isolated_vibe_home: &Path,
         mut on_chunk: F,
+        mut should_cancel: C,
     ) -> Result<VibeExecutionResult>
     where
         F: FnMut(VibeOutputChunk) -> Fut,
         Fut: Future<Output = Result<()>>,
+        C: FnMut() -> CFut,
+        CFut: Future<Output = Result<bool>>,
     {
-        let effective_prompt = compose_vibe_prompt(prompt);
+        let effective_prompt = compose_vibe_prompt(prompt, job_id, &self.otter_api_base_url);
         let mut cmd = Command::new(&self.vibe_bin);
         cmd.arg("--prompt")
             .arg(&effective_prompt)
@@ -168,22 +177,42 @@ impl VibeExecutor {
             Ok::<(), anyhow::Error>(())
         });
         drop(tx);
+        let mut cancel_poll = interval(Duration::from_millis(400));
+        cancel_poll.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
         let mut stdout_buffer = String::new();
         let mut stderr_buffer = String::new();
 
-        while let Some(chunk) = rx.recv().await {
-            match chunk.stream {
-                VibeStream::Stdout => {
-                    stdout_buffer.push_str(&chunk.line);
-                    stdout_buffer.push('\n');
+        loop {
+            tokio::select! {
+                maybe_chunk = rx.recv() => {
+                    let Some(chunk) = maybe_chunk else {
+                        break;
+                    };
+                    match chunk.stream {
+                        VibeStream::Stdout => {
+                            stdout_buffer.push_str(&chunk.line);
+                            stdout_buffer.push('\n');
+                        }
+                        VibeStream::Stderr => {
+                            stderr_buffer.push_str(&chunk.line);
+                            stderr_buffer.push('\n');
+                        }
+                    }
+                    if let Err(error) = on_chunk(chunk).await {
+                        let _ = child.kill().await;
+                        let _ = child.wait().await;
+                        return Err(error);
+                    }
                 }
-                VibeStream::Stderr => {
-                    stderr_buffer.push_str(&chunk.line);
-                    stderr_buffer.push('\n');
+                _ = cancel_poll.tick() => {
+                    if should_cancel().await? {
+                        let _ = child.kill().await;
+                        let _ = child.wait().await;
+                        bail!("job cancelled");
+                    }
                 }
             }
-            on_chunk(chunk).await?;
         }
 
         stdout_task
@@ -214,7 +243,7 @@ impl VibeExecutor {
     }
 }
 
-fn compose_vibe_prompt(user_prompt: &str) -> String {
+fn compose_vibe_prompt(user_prompt: &str, job_id: uuid::Uuid, otter_api_base_url: &str) -> String {
     format!(
         r#"SYSTEM REQUIREMENTS (ALWAYS APPLY):
 - Work in a project-specific subfolder under the current workspace. Never develop directly in workspace root.
@@ -223,9 +252,11 @@ fn compose_vibe_prompt(user_prompt: &str) -> String {
 - Always create a production-ready Dockerfile at the project root and use it as the primary run path.
 - Build and run the generated app/service inside Docker (do not run directly on host process as the main path).
 - Verify the container is running and expose the app on a reachable port from the current environment.
-- Always create a setup script named `setup.sh` at the project root that installs and configures everything needed to run the project.
-- Ensure `setup.sh` is executable (`chmod +x setup.sh`) and deterministic/idempotent (safe to run multiple times).
 - When implementation is complete, start the app/service in background and verify it runs.
+- Use this exact Job ID when setting demo URL: `{job_id}`.
+- ONLY AT THE END, AFTER EVERYTHING ELSE: after you determine the runnable app URL, call this API to set preview URL for this job:
+  `curl -sS -X POST "{otter_api_base_url}/v1/jobs/{job_id}/preview-url" -H "Content-Type: application/json" -d '{{"preview_url":"http://<host>:<port>"}}'`
+- Only send a real reachable HTTP/HTTPS URL as preview_url.
 - At the end, print clear run instructions: docker build command, docker run command, docker stop/remove command, and where the project lives.
 - Always include where to access the running app (URL/host port) in the final output.
 

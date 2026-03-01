@@ -17,8 +17,21 @@ pub struct AppConfig {
     pub default_workspace_path: Option<PathBuf>,
     pub default_workspace_subdir: String,
     pub lavoix_url: String,
+    pub otter_api_base_url: String,
     pub max_attempts: i32,
     pub worker_concurrency: usize,
+    pub runtime: RuntimeConfig,
+}
+
+#[derive(Clone, Debug)]
+pub struct RuntimeConfig {
+    pub enabled: bool,
+    pub docker_socket: String,
+    pub network_name: String,
+    pub container_name_prefix: String,
+    pub image_tag_prefix: String,
+    pub default_host: String,
+    pub max_log_lines: usize,
 }
 
 impl AppConfig {
@@ -70,6 +83,8 @@ impl AppConfig {
                 .unwrap_or_else(|_| "auto".to_string()),
             lavoix_url: env::var("OTTER_LAVOIX_URL")
                 .unwrap_or_else(|_| "http://lavoix:8090".to_string()),
+            otter_api_base_url: env::var("OTTER_API_BASE_URL")
+                .unwrap_or_else(|_| "http://otter-server:8080".to_string()),
             max_attempts: env::var("OTTER_MAX_ATTEMPTS")
                 .ok()
                 .and_then(|value| value.parse().ok())
@@ -78,6 +93,26 @@ impl AppConfig {
                 .ok()
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(1),
+            runtime: RuntimeConfig {
+                enabled: env::var("OTTER_RUNTIME_ENABLED")
+                    .ok()
+                    .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+                    .unwrap_or(false),
+                docker_socket: env::var("OTTER_RUNTIME_DOCKER_SOCKET")
+                    .unwrap_or_else(|_| "unix:///var/run/docker.sock".to_string()),
+                network_name: env::var("OTTER_RUNTIME_NETWORK")
+                    .unwrap_or_else(|_| "kymatics_default".to_string()),
+                container_name_prefix: env::var("OTTER_RUNTIME_CONTAINER_PREFIX")
+                    .unwrap_or_else(|_| "otter-ws".to_string()),
+                image_tag_prefix: env::var("OTTER_RUNTIME_IMAGE_PREFIX")
+                    .unwrap_or_else(|_| "otter/workspace".to_string()),
+                default_host: env::var("OTTER_RUNTIME_DEFAULT_HOST")
+                    .unwrap_or_else(|_| "http://localhost".to_string()),
+                max_log_lines: env::var("OTTER_RUNTIME_MAX_LOG_LINES")
+                    .ok()
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .unwrap_or(2000),
+            },
         })
     }
 }

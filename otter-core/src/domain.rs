@@ -37,6 +37,8 @@ pub struct Job {
     pub id: Uuid,
     pub workspace_id: Uuid,
     pub prompt: String,
+    pub preview_url: Option<String>,
+    pub is_paused: bool,
     pub status: JobStatus,
     pub priority: i32,
     pub schedule_at: Option<DateTime<Utc>>,
@@ -112,8 +114,35 @@ pub struct QueueItem {
     pub job_id: Uuid,
     pub workspace_id: Uuid,
     pub prompt: String,
+    pub is_paused: bool,
     pub priority: i32,
     pub schedule_at: Option<DateTime<Utc>>,
     pub queue_rank: i64,
     pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeContainerStatus {
+    Running,
+    Stopped,
+    Missing,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuntimePortBinding {
+    pub container_port: u16,
+    pub host_ip: String,
+    pub host_port: u16,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuntimeContainerInfo {
+    pub workspace_id: Uuid,
+    pub container_name: String,
+    pub image_tag: String,
+    pub container_id: Option<String>,
+    pub status: RuntimeContainerStatus,
+    pub ports: Vec<RuntimePortBinding>,
+    pub preferred_url: Option<String>,
 }

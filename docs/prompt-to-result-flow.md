@@ -12,6 +12,7 @@
 3. Otter inserts a `queued` job in PostgreSQL and records `accepted` + `queued` events.
 4. Otter enqueues job id in Redis.
 5. Worker dequeues job id from Redis, atomically claims that queued DB row, and marks it `running`.
+   - Paused queued jobs (`is_paused = true`) are skipped and requeued.
 6. Worker executes:
    - `vibe --prompt "<prompt>" --output json --workdir <workspace_root>`
    - with `VIBE_HOME=<isolated_workspace_home>`
@@ -20,7 +21,10 @@
    - success -> `succeeded` + `job_outputs` row + `completed` event
    - failure with retries left -> back to `queued` + `retry_queued` event
    - terminal failure -> `failed` + `failed` event
-9. Clients observe state via:
+9. Optional preview URL callback:
+   - Vibe prompt includes the active `job_id` and API callback format.
+   - Agent can call `POST /v1/jobs/{id}/preview-url` to register runnable demo URL.
+10. Clients observe state via:
    - `GET /v1/jobs/{id}`
    - `GET /v1/jobs/{id}/events`
    - `GET /v1/queue`
@@ -38,7 +42,7 @@
 - API -> Redis:
   - queue wake-up message containing job id
 - Worker -> Vibe:
-  - prompt text
+  - prompt text (with system requirements including `job_id` + preview URL callback contract)
   - execution directory (`--workdir`)
   - isolated trust context (`VIBE_HOME`)
 - Vibe -> Worker:

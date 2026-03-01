@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::convert::Infallible;
 use std::fs;
 use std::path::{Path as FsPath, PathBuf};
@@ -6,6 +5,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 
 use anyhow::Result;
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Multipart, Path, Query, State};
 use axum::http::HeaderValue;
 use axum::http::StatusCode;
@@ -14,6 +14,7 @@ use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::{Duration, Utc};
+use futures_util::StreamExt;
 use otter_core::config::AppConfig;
 use otter_core::db::Database;
 use otter_core::domain::{
@@ -21,6 +22,7 @@ use otter_core::domain::{
     QueueItem, UpdateQueuePositionRequest, Workspace,
 };
 use otter_core::queue::RedisQueue;
+use otter_core::runtime::docker_manager::split_stdout_and_cwd;
 use otter_core::service::OtterService;
 use tokio::process::Command;
 use tokio::time::Duration as TokioDuration;
@@ -33,7 +35,7 @@ use uuid::Uuid;
 struct AppState {
     service: Arc<OtterService<RedisQueue>>,
     lavoix_url: String,
-    shell_sessions: Arc<tokio::sync::Mutex<HashMap<String, String>>>,
+    shell_sessions: Arc<tokio::sync::Mutex<std::collections::HashMap<String, String>>>,
 }
 
 #[derive(serde::Deserialize)]
@@ -111,6 +113,34 @@ struct WorkspaceCommandResponse {
     timed_out: bool,
 }
 
+#[derive(serde::Deserialize)]
+struct RuntimeLogsQuery {
+    tail: Option<usize>,
+}
+
+#[derive(serde::Serialize)]
+struct RuntimeLogsResponse {
+    workspace_id: Uuid,
+    logs: String,
+}
+
+#[derive(serde::Deserialize)]
+struct ShellWsClientMessage {
+    command: String,
+    shell_session_id: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+struct ShellWsServerMessage {
+    event: String,
+    command: Option<String>,
+    stdout: Option<String>,
+    stderr: Option<String>,
+    exit_code: Option<i64>,
+    working_directory: Option<String>,
+    error: Option<String>,
+}
+
 #[derive(serde::Serialize)]
 struct JobResponse {
     job: Job,
@@ -129,6 +159,11 @@ struct VoiceEnqueueResponse {
     job: Job,
 }
 
+#[derive(serde::Deserialize)]
+struct SetJobPreviewUrlRequest {
+    preview_url: String,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -143,7 +178,7 @@ async fn main() -> Result<()> {
     let state = AppState {
         service,
         lavoix_url: config.lavoix_url.clone(),
-        shell_sessions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        shell_sessions: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
     };
 
     let allow_any_origin = config
@@ -179,10 +214,37 @@ async fn main() -> Result<()> {
         .route("/v1/workspaces/{id}/file", get(get_workspace_file))
         .route("/v1/workspaces/{id}/command", post(run_workspace_command))
         .route("/v1/workspaces/command", post(run_workspace_command_any))
+        .route(
+            "/v1/runtime/workspaces/{id}",
+            get(get_runtime_workspace_status),
+        )
+        .route(
+            "/v1/runtime/workspaces/{id}/start",
+            post(start_runtime_workspace_container),
+        )
+        .route(
+            "/v1/runtime/workspaces/{id}/stop",
+            post(stop_runtime_workspace_container),
+        )
+        .route(
+            "/v1/runtime/workspaces/{id}/restart",
+            post(restart_runtime_workspace_container),
+        )
+        .route(
+            "/v1/runtime/workspaces/{id}/logs",
+            get(get_runtime_workspace_logs),
+        )
+        .route(
+            "/v1/runtime/workspaces/{id}/shell/ws",
+            get(runtime_workspace_shell_ws),
+        )
         .route("/v1/prompts", post(enqueue_prompt))
         .route("/v1/voice/prompts", post(enqueue_voice_prompt))
         .route("/v1/jobs/{id}", get(get_job))
         .route("/v1/jobs/{id}/events", get(get_job_events))
+        .route("/v1/jobs/{id}/preview-url", post(set_job_preview_url))
+        .route("/v1/jobs/{id}/pause", post(pause_job))
+        .route("/v1/jobs/{id}/resume", post(resume_job))
         .route("/v1/events/stream", get(stream_job_events))
         .route("/v1/jobs/{id}/cancel", post(cancel_job))
         .route("/v1/queue", get(get_queue))
@@ -390,6 +452,166 @@ async fn run_workspace_command_any(
     .map(Json)
 }
 
+async fn get_runtime_workspace_status(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    state
+        .service
+        .runtime_status_for_workspace(id)
+        .await
+        .map(Json)
+        .map_err(internal_error)
+}
+
+async fn start_runtime_workspace_container(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    state
+        .service
+        .runtime_start_for_workspace(id)
+        .await
+        .map(Json)
+        .map_err(internal_error)
+}
+
+async fn stop_runtime_workspace_container(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    state
+        .service
+        .runtime_stop_for_workspace(id)
+        .await
+        .map(Json)
+        .map_err(internal_error)
+}
+
+async fn restart_runtime_workspace_container(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    state
+        .service
+        .runtime_restart_for_workspace(id)
+        .await
+        .map(Json)
+        .map_err(internal_error)
+}
+
+async fn get_runtime_workspace_logs(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Query(query): Query<RuntimeLogsQuery>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let tail = query.tail.unwrap_or(500).clamp(1, 10_000);
+    let logs = state
+        .service
+        .runtime_logs_for_workspace(id, tail)
+        .await
+        .map_err(internal_error)?;
+    Ok(Json(RuntimeLogsResponse {
+        workspace_id: id,
+        logs,
+    }))
+}
+
+async fn runtime_workspace_shell_ws(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    ws: WebSocketUpgrade,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    if !state.service.runtime_enabled() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "runtime is not enabled".to_string(),
+        ));
+    }
+    Ok(ws.on_upgrade(move |socket| handle_runtime_shell_ws(socket, state, id)))
+}
+
+async fn handle_runtime_shell_ws(mut socket: WebSocket, state: AppState, workspace_id: Uuid) {
+    while let Some(message) = socket.next().await {
+        let Ok(message) = message else {
+            break;
+        };
+        match message {
+            Message::Text(text) => {
+                let payload = match serde_json::from_str::<ShellWsClientMessage>(&text) {
+                    Ok(payload) => payload,
+                    Err(error) => {
+                        let _ = socket
+                            .send(Message::Text(
+                                serde_json::to_string(&ShellWsServerMessage {
+                                    event: "error".to_string(),
+                                    command: None,
+                                    stdout: None,
+                                    stderr: None,
+                                    exit_code: None,
+                                    working_directory: None,
+                                    error: Some(format!("invalid payload: {error}")),
+                                })
+                                .unwrap_or_else(|_| "{\"event\":\"error\"}".to_string())
+                                .into(),
+                            ))
+                            .await;
+                        continue;
+                    }
+                };
+                let session_id = payload
+                    .shell_session_id
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or("ws");
+                let result = state
+                    .service
+                    .runtime_exec_for_workspace(workspace_id, session_id, &payload.command)
+                    .await;
+                let response = match result {
+                    Ok(out) => ShellWsServerMessage {
+                        event: "result".to_string(),
+                        command: Some(payload.command),
+                        stdout: Some(out.stdout),
+                        stderr: Some(out.stderr),
+                        exit_code: Some(out.exit_code),
+                        working_directory: Some(out.cwd),
+                        error: None,
+                    },
+                    Err(error) => ShellWsServerMessage {
+                        event: "error".to_string(),
+                        command: Some(payload.command),
+                        stdout: None,
+                        stderr: None,
+                        exit_code: None,
+                        working_directory: None,
+                        error: Some(error.to_string()),
+                    },
+                };
+                if socket
+                    .send(Message::Text(
+                        serde_json::to_string(&response)
+                            .unwrap_or_else(|_| "{\"event\":\"error\"}".to_string())
+                            .into(),
+                    ))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            Message::Close(_) => break,
+            Message::Ping(payload) => {
+                if socket.send(Message::Pong(payload)).await.is_err() {
+                    break;
+                }
+            }
+            Message::Pong(_) | Message::Binary(_) => {}
+        }
+    }
+}
+
 async fn execute_workspace_command(
     state: AppState,
     workspace_id: Option<Uuid>,
@@ -422,6 +644,36 @@ async fn execute_workspace_command(
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
         .map(|value| value.chars().take(120).collect::<String>());
+    if state.service.runtime_enabled() {
+        let session_id = shell_session_id.as_deref().unwrap_or("workspace-shell");
+        match state
+            .service
+            .runtime_exec_for_workspace(resolved_workspace_id, session_id, &body.command)
+            .await
+        {
+            Ok(result) => {
+                return Ok(WorkspaceCommandResponse {
+                    workspace_id: resolved_workspace_id,
+                    command: body.command,
+                    working_directory: result.cwd,
+                    shell_session_id,
+                    exit_code: Some(result.exit_code as i32),
+                    stdout: result.stdout,
+                    stderr: result.stderr,
+                    timed_out: false,
+                });
+            }
+            Err(error) => {
+                warn!(
+                    workspace_id = %resolved_workspace_id,
+                    command = %body.command,
+                    error = %error,
+                    "runtime command failed; falling back to host workspace shell"
+                );
+            }
+        }
+    }
+
     let session_key = shell_session_id
         .as_ref()
         .map(|session_id| format!("{resolved_workspace_id}:{session_id}"));
@@ -475,7 +727,8 @@ async fn execute_workspace_command(
     }
 
     let stdout_with_marker = String::from_utf8_lossy(&output.stdout).to_string();
-    let (stdout, resolved_cwd) = split_stdout_and_cwd(&stdout_with_marker, &cwd);
+    let (stdout, resolved_cwd) =
+        split_stdout_and_cwd(&stdout_with_marker, &cwd.display().to_string());
     if let Some(key) = session_key.as_ref() {
         state
             .shell_sessions
@@ -494,27 +747,6 @@ async fn execute_workspace_command(
         stderr: String::from_utf8_lossy(&output.stderr).to_string(),
         timed_out,
     })
-}
-
-fn split_stdout_and_cwd(stdout: &str, fallback_cwd: &FsPath) -> (String, String) {
-    const CWD_MARKER: &str = "__OTTER_CWD__:";
-    let mut cleaned_lines = Vec::new();
-    let mut resolved_cwd = fallback_cwd.display().to_string();
-    for raw_line in stdout.lines() {
-        if let Some((_, cwd)) = raw_line.split_once(CWD_MARKER) {
-            let candidate = cwd.trim();
-            if !candidate.is_empty() {
-                resolved_cwd = candidate.to_string();
-            }
-            continue;
-        }
-        cleaned_lines.push(raw_line);
-    }
-    let mut cleaned_stdout = cleaned_lines.join("\n");
-    if stdout.ends_with('\n') && !cleaned_stdout.is_empty() {
-        cleaned_stdout.push('\n');
-    }
-    (cleaned_stdout, resolved_cwd)
 }
 
 async fn enqueue_prompt(
@@ -729,6 +961,75 @@ async fn cancel_job(
     Ok(StatusCode::NO_CONTENT)
 }
 
+async fn pause_job(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let paused = state.service.pause_job(id).await.map_err(internal_error)?;
+    if !paused {
+        return Err((StatusCode::NOT_FOUND, "queued job not found".into()));
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn resume_job(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let resumed = state.service.resume_job(id).await.map_err(internal_error)?;
+    if !resumed {
+        return Err((StatusCode::NOT_FOUND, "paused queued job not found".into()));
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn set_job_preview_url(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(body): Json<SetJobPreviewUrlRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let preview_url = body.preview_url.trim();
+    if preview_url.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "preview_url must not be empty".to_string(),
+        ));
+    }
+    let parsed = reqwest::Url::parse(preview_url).map_err(|error| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("preview_url must be a valid absolute URL: {error}"),
+        )
+    })?;
+    if parsed.scheme() != "http" && parsed.scheme() != "https" {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "preview_url must use http or https".to_string(),
+        ));
+    }
+
+    let updated = state
+        .service
+        .db
+        .set_job_preview_url(id, preview_url)
+        .await
+        .map_err(internal_error)?;
+    if !updated {
+        return Err((StatusCode::NOT_FOUND, "job not found".to_string()));
+    }
+    state
+        .service
+        .db
+        .insert_job_event(
+            id,
+            "preview_url_set",
+            serde_json::json!({ "preview_url": preview_url }),
+        )
+        .await
+        .map_err(internal_error)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 async fn get_history(
     State(state): State<AppState>,
     Query(query): Query<HistoryQuery>,
@@ -873,12 +1174,11 @@ fn list_workspace_entries(
 #[cfg(test)]
 mod tests {
     use super::split_stdout_and_cwd;
-    use std::path::Path;
 
     #[test]
     fn strips_cwd_marker_from_stdout() {
         let stdout = "hello\n__OTTER_CWD__:/tmp/demo\n";
-        let (cleaned, cwd) = split_stdout_and_cwd(stdout, Path::new("/fallback"));
+        let (cleaned, cwd) = split_stdout_and_cwd(stdout, "/fallback");
         assert_eq!(cleaned, "hello\n");
         assert_eq!(cwd, "/tmp/demo");
     }
