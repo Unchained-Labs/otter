@@ -60,11 +60,25 @@ curl http://localhost:8080/healthz
 - `OTTER_CORS_ALLOWED_ORIGINS` (default `http://localhost:5173`, comma-separated)
 - `OTTER_VIBE_BIN` (default `vibe`)
 - `OTTER_VIBE_HOME_BASE` (default `/var/lib/otter/vibe`)
+- `OTTER_VIBE_MODEL` (optional, example `mistral-large-3`)
+- `OTTER_VIBE_PROVIDER` (optional, example `mistral`)
+- `OTTER_VIBE_EXTRA_ENV` (optional, comma-separated `KEY=VALUE` pairs forwarded to vibe process)
 - `OTTER_DEFAULT_WORKSPACE_PATH` (optional fallback workspace root when enqueue omits `workspace_id`)
 - `OTTER_MAX_ATTEMPTS` (default `5`)
 - `OTTER_WORKER_CONCURRENCY` (default `1`)
 - `OTTER_ALLOWED_ROOTS` (optional `:`-separated allowlist)
 - `MISTRAL_API_KEY` (read from `.env`, passed to server/worker/vibe process)
+
+### Selecting a Vibe model
+
+Otter now supports explicit model/provider passthrough to the Vibe subprocess via environment:
+
+```bash
+OTTER_VIBE_MODEL=mistral-large-3
+OTTER_VIBE_PROVIDER=mistral
+```
+
+These are forwarded as `VIBE_MODEL` / `MISTRAL_MODEL` and `VIBE_PROVIDER` for compatibility.
 
 ## API Endpoints (MVP)
 

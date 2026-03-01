@@ -53,7 +53,12 @@ impl<Q: Queue> OtterService<Q> {
                 allowed_roots,
                 config.vibe_base_home.clone(),
             )),
-            vibe_executor: Arc::new(VibeExecutor::new(config.vibe_bin.clone())),
+            vibe_executor: Arc::new(VibeExecutor::new(
+                config.vibe_bin.clone(),
+                config.vibe_model.clone(),
+                config.vibe_provider.clone(),
+                config.vibe_extra_env.clone(),
+            )),
             max_attempts: config.max_attempts,
             default_workspace_path: config.default_workspace_path.clone(),
             default_workspace_subdir: config.default_workspace_subdir.clone(),

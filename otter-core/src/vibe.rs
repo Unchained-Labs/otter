@@ -11,6 +11,9 @@ use tokio::sync::mpsc;
 #[derive(Debug, Clone)]
 pub struct VibeExecutor {
     pub vibe_bin: String,
+    pub vibe_model: Option<String>,
+    pub vibe_provider: Option<String>,
+    pub vibe_extra_env: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -35,8 +38,32 @@ pub struct VibeOutputChunk {
 }
 
 impl VibeExecutor {
-    pub fn new(vibe_bin: String) -> Self {
-        Self { vibe_bin }
+    pub fn new(
+        vibe_bin: String,
+        vibe_model: Option<String>,
+        vibe_provider: Option<String>,
+        vibe_extra_env: Vec<(String, String)>,
+    ) -> Self {
+        Self {
+            vibe_bin,
+            vibe_model,
+            vibe_provider,
+            vibe_extra_env,
+        }
+    }
+
+    fn apply_model_and_provider_env(&self, command: &mut Command) {
+        if let Some(model) = &self.vibe_model {
+            // Set both keys for compatibility with different Vibe/Mistral env conventions.
+            command.env("VIBE_MODEL", model);
+            command.env("MISTRAL_MODEL", model);
+        }
+        if let Some(provider) = &self.vibe_provider {
+            command.env("VIBE_PROVIDER", provider);
+        }
+        for (key, value) in &self.vibe_extra_env {
+            command.env(key, value);
+        }
     }
 
     pub async fn run_prompt(
@@ -46,8 +73,8 @@ impl VibeExecutor {
         isolated_vibe_home: &Path,
     ) -> Result<VibeExecutionResult> {
         let effective_prompt = compose_vibe_prompt(prompt);
-        let output = Command::new(&self.vibe_bin)
-            .arg("--prompt")
+        let mut cmd = Command::new(&self.vibe_bin);
+        cmd.arg("--prompt")
             .arg(&effective_prompt)
             .arg("--output")
             .arg("json")
@@ -55,7 +82,9 @@ impl VibeExecutor {
             .arg(workspace_path.as_os_str())
             .env("VIBE_HOME", isolated_vibe_home.as_os_str())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stderr(Stdio::piped());
+        self.apply_model_and_provider_env(&mut cmd);
+        let output = cmd
             .output()
             .await
             .with_context(|| format!("failed to execute {}", self.vibe_bin))?;
@@ -93,8 +122,8 @@ impl VibeExecutor {
         Fut: Future<Output = Result<()>>,
     {
         let effective_prompt = compose_vibe_prompt(prompt);
-        let mut child = Command::new(&self.vibe_bin)
-            .arg("--prompt")
+        let mut cmd = Command::new(&self.vibe_bin);
+        cmd.arg("--prompt")
             .arg(&effective_prompt)
             .arg("--output")
             .arg("json")
@@ -102,7 +131,9 @@ impl VibeExecutor {
             .arg(workspace_path.as_os_str())
             .env("VIBE_HOME", isolated_vibe_home.as_os_str())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stderr(Stdio::piped());
+        self.apply_model_and_provider_env(&mut cmd);
+        let mut child = cmd
             .spawn()
             .with_context(|| format!("failed to execute {}", self.vibe_bin))?;
 
