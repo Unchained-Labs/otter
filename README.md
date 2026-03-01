@@ -89,6 +89,7 @@ These are forwarded as `VIBE_MODEL` / `MISTRAL_MODEL` and `VIBE_PROVIDER` for co
 - `POST /v1/projects`, `GET /v1/projects`
 - `POST /v1/workspaces`, `GET /v1/workspaces`
 - `GET /v1/workspaces/{id}/tree`, `GET /v1/workspaces/{id}/file`
+- `POST /v1/workspaces/{id}/command` and `POST /v1/workspaces/command` support `shell_session_id` for persistent shell cwd across commands (`cd` state is retained per session).
 - `POST /v1/prompts` (`workspace_id` optional when `OTTER_DEFAULT_WORKSPACE_PATH` is configured)
 - `GET /v1/jobs/{id}`
 - `GET /v1/jobs/{id}/events`
