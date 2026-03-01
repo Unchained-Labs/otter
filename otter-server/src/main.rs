@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::fs;
 use std::path::{Path as FsPath, PathBuf};
@@ -32,6 +33,7 @@ use uuid::Uuid;
 struct AppState {
     service: Arc<OtterService<RedisQueue>>,
     lavoix_url: String,
+    shell_sessions: Arc<tokio::sync::Mutex<HashMap<String, String>>>,
 }
 
 #[derive(serde::Deserialize)]
@@ -60,6 +62,7 @@ struct WorkspaceFileQuery {
 struct WorkspaceCommandRequest {
     command: String,
     working_directory: Option<String>,
+    shell_session_id: Option<String>,
     timeout_seconds: Option<u64>,
 }
 
@@ -68,6 +71,7 @@ struct WorkspaceCommandDispatchRequest {
     workspace_id: Option<Uuid>,
     command: String,
     working_directory: Option<String>,
+    shell_session_id: Option<String>,
     timeout_seconds: Option<u64>,
 }
 
@@ -100,6 +104,7 @@ struct WorkspaceCommandResponse {
     workspace_id: Uuid,
     command: String,
     working_directory: String,
+    shell_session_id: Option<String>,
     exit_code: Option<i32>,
     stdout: String,
     stderr: String,
@@ -138,6 +143,7 @@ async fn main() -> Result<()> {
     let state = AppState {
         service,
         lavoix_url: config.lavoix_url.clone(),
+        shell_sessions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
     };
 
     let allow_any_origin = config
@@ -376,6 +382,7 @@ async fn run_workspace_command_any(
         WorkspaceCommandRequest {
             command: body.command,
             working_directory: body.working_directory,
+            shell_session_id: body.shell_session_id,
             timeout_seconds: body.timeout_seconds,
         },
     )
@@ -409,9 +416,31 @@ async fn execute_workspace_command(
         .map_err(internal_error)?
         .ok_or((StatusCode::NOT_FOUND, "workspace not found".to_string()))?;
 
-    let cwd =
-        resolve_workspace_subpath(&workspace, body.working_directory.as_deref().unwrap_or(""))?;
+    let shell_session_id = body
+        .shell_session_id
+        .as_ref()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .map(|value| value.chars().take(120).collect::<String>());
+    let session_key = shell_session_id
+        .as_ref()
+        .map(|session_id| format!("{resolved_workspace_id}:{session_id}"));
+    let persisted_cwd = if let Some(key) = &session_key {
+        state.shell_sessions.lock().await.get(key).cloned()
+    } else {
+        None
+    };
+    let requested_working_directory = body
+        .working_directory
+        .clone()
+        .or(persisted_cwd)
+        .unwrap_or_default();
+    let cwd = resolve_workspace_subpath(&workspace, &requested_working_directory)?;
     let timeout_seconds = body.timeout_seconds.unwrap_or(30).clamp(1, 300);
+    let wrapped_command = format!(
+        "({command}); __otter_exit=$?; printf '\\n__OTTER_CWD__:%s\\n' \"$PWD\"; exit $__otter_exit",
+        command = body.command
+    );
 
     info!(
         workspace_id = %resolved_workspace_id,
@@ -425,7 +454,7 @@ async fn execute_workspace_command(
         .arg(format!("{timeout_seconds}s"))
         .arg("bash")
         .arg("-lc")
-        .arg(&body.command)
+        .arg(&wrapped_command)
         .current_dir(&cwd)
         .env("VIBE_HOME", &workspace.isolated_vibe_home)
         .stdout(Stdio::piped())
@@ -445,15 +474,47 @@ async fn execute_workspace_command(
         );
     }
 
+    let stdout_with_marker = String::from_utf8_lossy(&output.stdout).to_string();
+    let (stdout, resolved_cwd) = split_stdout_and_cwd(&stdout_with_marker, &cwd);
+    if let Some(key) = session_key.as_ref() {
+        state
+            .shell_sessions
+            .lock()
+            .await
+            .insert(key.clone(), resolved_cwd.clone());
+    }
+
     Ok(WorkspaceCommandResponse {
         workspace_id: resolved_workspace_id,
         command: body.command,
-        working_directory: cwd.display().to_string(),
+        working_directory: resolved_cwd,
+        shell_session_id,
         exit_code: output.status.code(),
-        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+        stdout,
         stderr: String::from_utf8_lossy(&output.stderr).to_string(),
         timed_out,
     })
+}
+
+fn split_stdout_and_cwd(stdout: &str, fallback_cwd: &FsPath) -> (String, String) {
+    const CWD_MARKER: &str = "__OTTER_CWD__:";
+    let mut cleaned_lines = Vec::new();
+    let mut resolved_cwd = fallback_cwd.display().to_string();
+    for raw_line in stdout.lines() {
+        if let Some((_, cwd)) = raw_line.split_once(CWD_MARKER) {
+            let candidate = cwd.trim();
+            if !candidate.is_empty() {
+                resolved_cwd = candidate.to_string();
+            }
+            continue;
+        }
+        cleaned_lines.push(raw_line);
+    }
+    let mut cleaned_stdout = cleaned_lines.join("\n");
+    if stdout.ends_with('\n') && !cleaned_stdout.is_empty() {
+        cleaned_stdout.push('\n');
+    }
+    (cleaned_stdout, resolved_cwd)
 }
 
 async fn enqueue_prompt(
@@ -807,4 +868,18 @@ fn list_workspace_entries(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::split_stdout_and_cwd;
+    use std::path::Path;
+
+    #[test]
+    fn strips_cwd_marker_from_stdout() {
+        let stdout = "hello\n__OTTER_CWD__:/tmp/demo\n";
+        let (cleaned, cwd) = split_stdout_and_cwd(stdout, Path::new("/fallback"));
+        assert_eq!(cleaned, "hello\n");
+        assert_eq!(cwd, "/tmp/demo");
+    }
 }

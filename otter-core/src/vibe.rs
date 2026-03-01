@@ -281,9 +281,11 @@ fn value_to_text(value: &serde_json::Value) -> Option<String> {
         let joined = array
             .iter()
             .filter_map(|item| {
-                item.as_str()
-                    .map(ToString::to_string)
-                    .or_else(|| item.get("text").and_then(|v| v.as_str()).map(ToString::to_string))
+                item.as_str().map(ToString::to_string).or_else(|| {
+                    item.get("text")
+                        .and_then(|v| v.as_str())
+                        .map(ToString::to_string)
+                })
             })
             .collect::<Vec<_>>()
             .join("");
