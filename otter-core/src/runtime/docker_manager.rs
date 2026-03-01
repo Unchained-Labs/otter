@@ -138,8 +138,10 @@ impl DockerRuntimeManager {
         let status = container
             .state
             .and_then(|state| state.status)
-            .map(|status| match status.as_str() {
-                "running" => RuntimeContainerStatus::Running,
+            .map(|status| match status {
+                bollard::models::ContainerStateStatusEnum::RUNNING => {
+                    RuntimeContainerStatus::Running
+                }
                 _ => RuntimeContainerStatus::Stopped,
             })
             .unwrap_or(RuntimeContainerStatus::Stopped);
@@ -254,7 +256,7 @@ impl DockerRuntimeManager {
                     attach_stdout: Some(true),
                     attach_stderr: Some(true),
                     cmd: Some(vec!["bash", "-lc", wrapped_command.as_str()]),
-                    working_dir: cwd.map(str::to_string),
+                    working_dir: cwd,
                     ..Default::default()
                 },
             )
@@ -270,6 +272,7 @@ impl DockerRuntimeManager {
                 Some(StartExecOptions {
                     detach: false,
                     tty: false,
+                    output_capacity: None,
                 }),
             )
             .await
@@ -322,8 +325,11 @@ impl DockerRuntimeManager {
             pull: false,
             ..Default::default()
         };
-        let body = stream::once(async move { Ok::<Bytes, std::io::Error>(Bytes::from(context)) });
-        let mut stream = self.docker.build_image(options, None, Some(body));
+        let body_stream =
+            stream::once(async move { Ok::<Bytes, std::io::Error>(Bytes::from(context)) });
+        let mut stream = self
+            .docker
+            .build_image(options, None, Some(body_stream.into()));
         while let Some(chunk) = stream
             .try_next()
             .await
