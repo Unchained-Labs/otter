@@ -84,19 +84,22 @@ impl Database {
 
     pub async fn create_workspace(
         &self,
+        workspace_id: Uuid,
         request: CreateWorkspaceRequest,
+        canonical_root_path: String,
         isolated_vibe_home: String,
     ) -> Result<Workspace> {
         let workspace = sqlx::query_as::<_, Workspace>(
             r#"
-            INSERT INTO workspaces (project_id, name, root_path, isolated_vibe_home)
-            VALUES ($1, $2, $3, $4)
+            INSERT INTO workspaces (id, project_id, name, root_path, isolated_vibe_home)
+            VALUES ($1, $2, $3, $4, $5)
             RETURNING id, project_id, name, root_path, isolated_vibe_home, created_at
             "#,
         )
+        .bind(workspace_id)
         .bind(request.project_id)
         .bind(request.name)
-        .bind(request.root_path)
+        .bind(canonical_root_path)
         .bind(isolated_vibe_home)
         .fetch_one(&self.pool)
         .await?;
@@ -283,36 +286,19 @@ impl Database {
         Ok(event)
     }
 
-    pub async fn mark_job_running(&self, job_id: Uuid) -> Result<PgQueryResult> {
-        let result = sqlx::query(
-            "UPDATE jobs SET status = 'running', updated_at = now() WHERE id = $1 AND status = 'queued'",
-        )
-        .bind(job_id)
-        .execute(&self.pool)
-        .await?;
-        Ok(result)
-    }
-
-    pub async fn claim_next_queued_job(&self) -> Result<Option<Job>> {
+    pub async fn claim_queued_job_by_id(&self, job_id: Uuid) -> Result<Option<Job>> {
         let job = sqlx::query_as::<_, Job>(
             r#"
-            WITH next_job AS (
-                SELECT id
-                FROM jobs
-                WHERE status = 'queued'
-                  AND (schedule_at IS NULL OR schedule_at <= now())
-                ORDER BY priority ASC, created_at ASC
-                FOR UPDATE SKIP LOCKED
-                LIMIT 1
-            )
             UPDATE jobs j
             SET status = 'running',
                 updated_at = now()
-            FROM next_job
-            WHERE j.id = next_job.id
+            WHERE j.id = $1
+              AND j.status = 'queued'
+              AND (j.schedule_at IS NULL OR j.schedule_at <= now())
             RETURNING j.id, j.workspace_id, j.prompt, j.status, j.priority, j.schedule_at, j.attempts, j.max_attempts, j.error, j.created_at, j.updated_at
             "#,
         )
+        .bind(job_id)
         .fetch_optional(&self.pool)
         .await?;
         Ok(job)
@@ -333,12 +319,17 @@ impl Database {
         job_id: Uuid,
         assistant_output: String,
         raw_json: serde_json::Value,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let mut tx = self.pool.begin().await?;
-        sqlx::query("UPDATE jobs SET status = 'succeeded', updated_at = now() WHERE id = $1")
+        let result =
+            sqlx::query("UPDATE jobs SET status = 'succeeded', updated_at = now() WHERE id = $1 AND status = 'running'")
             .bind(job_id)
             .execute(&mut *tx)
             .await?;
+        if result.rows_affected() == 0 {
+            tx.rollback().await?;
+            return Ok(false);
+        }
         sqlx::query(
             "INSERT INTO job_outputs (job_id, assistant_output, raw_json) VALUES ($1, $2, $3)",
         )
@@ -348,37 +339,39 @@ impl Database {
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
-        Ok(())
+        Ok(true)
     }
 
-    pub async fn fail_job(&self, job_id: Uuid, error: String) -> Result<()> {
-        sqlx::query(
+    pub async fn fail_job(&self, job_id: Uuid, error: String) -> Result<bool> {
+        let result = sqlx::query(
             r#"
             UPDATE jobs
             SET status = 'failed', attempts = attempts + 1, error = $2, updated_at = now()
             WHERE id = $1
+              AND status = 'running'
             "#,
         )
         .bind(job_id)
         .bind(error)
         .execute(&self.pool)
         .await?;
-        Ok(())
+        Ok(result.rows_affected() > 0)
     }
 
-    pub async fn set_job_back_to_queue(&self, job_id: Uuid, error: String) -> Result<()> {
-        sqlx::query(
+    pub async fn set_job_back_to_queue(&self, job_id: Uuid, error: String) -> Result<bool> {
+        let result = sqlx::query(
             r#"
             UPDATE jobs
             SET status = 'queued', attempts = attempts + 1, error = $2, updated_at = now()
             WHERE id = $1
+              AND status = 'running'
             "#,
         )
         .bind(job_id)
         .bind(error)
         .execute(&self.pool)
         .await?;
-        Ok(())
+        Ok(result.rows_affected() > 0)
     }
 
     pub async fn fetch_job_output(&self, job_id: Uuid) -> Result<Option<JobOutput>> {
