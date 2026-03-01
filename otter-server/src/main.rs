@@ -111,9 +111,9 @@ async fn main() -> Result<()> {
         .init();
 
     let config = AppConfig::from_env()?;
-    let database = Arc::new(Database::connect(&config.database_url).await?);
-    database.migrate().await?;
-    let queue = Arc::new(RedisQueue::connect(&config.redis_url).await?);
+    let database = connect_database_with_retry(&config.database_url).await?;
+    migrate_with_retry(database.clone()).await?;
+    let queue = connect_redis_with_retry(&config.redis_url).await?;
     let service = Arc::new(OtterService::new(&config, database, queue));
     let state = AppState { service };
 
@@ -168,6 +168,60 @@ async fn main() -> Result<()> {
     info!("otter-server listening on {}", config.listen_addr);
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+async fn connect_database_with_retry(database_url: &str) -> Result<Arc<Database>> {
+    let mut attempts: u32 = 0;
+    loop {
+        attempts += 1;
+        match Database::connect(database_url).await {
+            Ok(database) => {
+                info!(attempts, "connected to postgres");
+                return Ok(Arc::new(database));
+            }
+            Err(error) if attempts < 30 => {
+                warn!(attempts, error = %error, "postgres connect failed; retrying");
+                tokio::time::sleep(TokioDuration::from_secs(2)).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+async fn migrate_with_retry(database: Arc<Database>) -> Result<()> {
+    let mut attempts: u32 = 0;
+    loop {
+        attempts += 1;
+        match database.migrate().await {
+            Ok(()) => {
+                info!(attempts, "database migrations applied");
+                return Ok(());
+            }
+            Err(error) if attempts < 20 => {
+                warn!(attempts, error = %error, "database migration failed; retrying");
+                tokio::time::sleep(TokioDuration::from_secs(2)).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+async fn connect_redis_with_retry(redis_url: &str) -> Result<Arc<RedisQueue>> {
+    let mut attempts: u32 = 0;
+    loop {
+        attempts += 1;
+        match RedisQueue::connect(redis_url).await {
+            Ok(queue) => {
+                info!(attempts, "connected to redis");
+                return Ok(Arc::new(queue));
+            }
+            Err(error) if attempts < 30 => {
+                warn!(attempts, error = %error, "redis connect failed; retrying");
+                tokio::time::sleep(TokioDuration::from_secs(2)).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 async fn healthz() -> impl IntoResponse {
