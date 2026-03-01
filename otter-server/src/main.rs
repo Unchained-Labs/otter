@@ -14,7 +14,7 @@ use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::{Duration, Utc};
-use futures_util::{SinkExt, StreamExt};
+use futures_util::StreamExt;
 use otter_core::config::AppConfig;
 use otter_core::db::Database;
 use otter_core::domain::{
@@ -544,7 +544,8 @@ async fn handle_runtime_shell_ws(mut socket: WebSocket, state: AppState, workspa
                                     working_directory: None,
                                     error: Some(format!("invalid payload: {error}")),
                                 })
-                                .unwrap_or_else(|_| "{\"event\":\"error\"}".to_string()),
+                                .unwrap_or_else(|_| "{\"event\":\"error\"}".to_string())
+                                .into(),
                             ))
                             .await;
                         continue;
@@ -583,7 +584,8 @@ async fn handle_runtime_shell_ws(mut socket: WebSocket, state: AppState, workspa
                 if socket
                     .send(Message::Text(
                         serde_json::to_string(&response)
-                            .unwrap_or_else(|_| "{\"event\":\"error\"}".to_string()),
+                            .unwrap_or_else(|_| "{\"event\":\"error\"}".to_string())
+                            .into(),
                     ))
                     .await
                     .is_err()
