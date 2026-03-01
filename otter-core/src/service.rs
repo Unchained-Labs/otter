@@ -16,7 +16,7 @@ use crate::domain::{
     Project, QueueItem, UpdateQueuePositionRequest, Workspace,
 };
 use crate::queue::{Queue, QueueMessage};
-use crate::vibe::VibeExecutor;
+use crate::vibe::{VibeExecutor, VibeOutputChunk};
 use crate::workspace::WorkspaceManager;
 
 const DEFAULT_QUEUE_NAME: &str = "otter:jobs";
@@ -279,7 +279,24 @@ impl<Q: Queue> OtterService<Q> {
 
         let result = self
             .vibe_executor
-            .run_prompt(&job.prompt, &workspace_path, &isolated_vibe_home)
+            .run_prompt_streaming(
+                &job.prompt,
+                &workspace_path,
+                &isolated_vibe_home,
+                |chunk: VibeOutputChunk| async move {
+                    self.db
+                        .insert_job_event(
+                            job.id,
+                            "output_chunk",
+                            serde_json::json!({
+                                "stream": chunk.stream,
+                                "line": chunk.line
+                            }),
+                        )
+                        .await?;
+                    Ok(())
+                },
+            )
             .await?;
 
         let completed = self
