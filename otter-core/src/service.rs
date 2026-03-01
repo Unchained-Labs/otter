@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
+use std::{fs, path::Path};
 
 use anyhow::{anyhow, Result};
 use chrono::Utc;
@@ -84,6 +85,7 @@ impl<Q: Queue> OtterService<Q> {
     }
 
     pub async fn list_workspaces(&self) -> Result<Vec<Workspace>> {
+        self.sync_workspace_directories_from_default_root().await?;
         self.db.list_workspaces().await
     }
 
@@ -173,6 +175,88 @@ impl<Q: Queue> OtterService<Q> {
             .await?;
 
         Ok(workspace.id)
+    }
+
+    async fn sync_workspace_directories_from_default_root(&self) -> Result<()> {
+        let Some(default_root) = &self.default_workspace_path else {
+            return Ok(());
+        };
+        let canonical_root = self
+            .workspace_manager
+            .validate_workspace_path(default_root.as_path())?;
+        let project_id = self.ensure_default_project().await?;
+        let entries = fs::read_dir(&canonical_root)?;
+        for entry in entries {
+            let Ok(entry) = entry else {
+                continue;
+            };
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if !file_type.is_dir() {
+                continue;
+            }
+            let directory_name = entry.file_name().to_string_lossy().to_string();
+            if directory_name.starts_with('.') || directory_name.starts_with("__") {
+                continue;
+            }
+            let dir_path = entry.path();
+            let Ok(canonical_dir) = self
+                .workspace_manager
+                .validate_workspace_path(Path::new(&dir_path))
+            else {
+                continue;
+            };
+            let root_path = canonical_dir.to_string_lossy().to_string();
+            if self
+                .db
+                .find_workspace_by_root_path(&root_path)
+                .await?
+                .is_some()
+            {
+                continue;
+            }
+
+            let workspace_id = Uuid::new_v4();
+            let isolated_vibe_home = self
+                .workspace_manager
+                .prepare_isolated_vibe_home(workspace_id, &canonical_dir)
+                .await?;
+            let name = directory_name;
+            let _ = self
+                .db
+                .create_workspace(
+                    workspace_id,
+                    CreateWorkspaceRequest {
+                        project_id,
+                        name,
+                        root_path: root_path.clone(),
+                    },
+                    root_path,
+                    isolated_vibe_home.display().to_string(),
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn ensure_default_project(&self) -> Result<Uuid> {
+        const DEFAULT_PROJECT_NAME: &str = "default";
+        let project_id =
+            if let Some(project) = self.db.find_project_by_name(DEFAULT_PROJECT_NAME).await? {
+                project.id
+            } else {
+                self.db
+                    .create_project(CreateProjectRequest {
+                        name: DEFAULT_PROJECT_NAME.to_string(),
+                        description: Some(
+                            "Auto-created project for OTTER_DEFAULT_WORKSPACE_PATH".to_string(),
+                        ),
+                    })
+                    .await?
+                    .id
+            };
+        Ok(project_id)
     }
 
     pub async fn process_next_job(&self) -> Result<Option<Uuid>> {
