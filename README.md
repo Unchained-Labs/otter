@@ -67,6 +67,7 @@ curl http://localhost:8080/healthz
 - `OTTER_VIBE_MODEL` (optional, example `mistral-large-3`)
 - `OTTER_VIBE_PROVIDER` (optional, example `mistral`)
 - `OTTER_VIBE_EXTRA_ENV` (optional, comma-separated `KEY=VALUE` pairs forwarded to vibe process)
+- `OTTER_API_BASE_URL` (default `http://otter-server:8080`, used in system prompt instructions so Vibe can post job preview URLs)
 - `OTTER_DEFAULT_WORKSPACE_PATH` (optional fallback workspace root when enqueue omits `workspace_id`)
 - `OTTER_MAX_ATTEMPTS` (default `5`)
 - `OTTER_WORKER_CONCURRENCY` (default `1`)
@@ -102,6 +103,9 @@ These are forwarded as `VIBE_MODEL` / `MISTRAL_MODEL` and `VIBE_PROVIDER` for co
 - `GET /v1/jobs/{id}/events`
 - `GET /v1/events/stream` (includes `output_chunk` events)
 - `POST /v1/jobs/{id}/cancel`
+- `POST /v1/jobs/{id}/pause`
+- `POST /v1/jobs/{id}/resume`
+- `POST /v1/jobs/{id}/preview-url` (set demo URL for browser preview, body: `{ "preview_url": "http://host:port" }`)
 - `GET /v1/queue`
 - `PATCH /v1/queue/{id}` (update queue position via priority)
 - `GET /v1/history`
@@ -171,7 +175,15 @@ Otter composes a system prompt that enforces safe and repeatable project executi
 - Build and run the generated app inside Docker as the primary execution path.
 - Generate an executable `setup.sh` at project root.
 - Start the generated app/service in background.
+- Use the provided Job ID and call Otter preview URL API when runtime URL is known:
+  - `POST /v1/jobs/{job_id}/preview-url`
 - Print clear run/stop instructions and project location.
 - Include app access information (URL and host port) in the final output.
 
 After a successful vibe execution, Otter attempts to run `setup.sh` and streams its output back as `output_chunk` events.
+
+## Queue Pause/Resume
+
+- Queued jobs can be paused without changing status from `queued`.
+- Paused queued jobs are not claimable by workers until resumed.
+- Resume re-enqueues the job message so it can run immediately when capacity is available.
