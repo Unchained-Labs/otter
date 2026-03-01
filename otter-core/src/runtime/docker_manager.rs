@@ -3,13 +3,13 @@ use std::path::Path;
 
 use anyhow::{anyhow, Context, Result};
 use bollard::body_full;
-use bollard::container::{InspectContainerOptions, LogOutput, StartContainerOptions};
+use bollard::container::LogOutput;
 use bollard::exec::{CreateExecOptions, StartExecOptions, StartExecResults};
 use bollard::models::{ContainerCreateBody, HostConfig, PortBinding};
 use bollard::query_parameters::{
-    BuildImageOptionsBuilder, CreateContainerOptionsBuilder, ListContainersOptionsBuilder,
-    LogsOptionsBuilder, RemoveContainerOptionsBuilder, RestartContainerOptionsBuilder,
-    StopContainerOptionsBuilder,
+    BuildImageOptionsBuilder, CreateContainerOptionsBuilder, InspectContainerOptions,
+    ListContainersOptionsBuilder, LogsOptionsBuilder, RemoveContainerOptionsBuilder,
+    RestartContainerOptionsBuilder, StartContainerOptions, StopContainerOptionsBuilder,
 };
 use bollard::{Docker, API_DEFAULT_VERSION};
 use bytes::Bytes;
@@ -216,7 +216,7 @@ impl DockerRuntimeManager {
             .stdout(true)
             .stderr(true)
             .follow(false)
-            .tail(tail.to_string())
+            .tail(&tail.to_string())
             .build();
         let mut stream = self.docker.logs(&container_name, Some(logs_opts));
 
@@ -322,8 +322,11 @@ impl DockerRuntimeManager {
             .await
             .context("failed docker image build stream")?
         {
-            if let Some(error) = chunk.error {
-                return Err(anyhow!("docker image build failed: {error}"));
+            if let Some(error_detail) = chunk.error_detail {
+                let msg = error_detail
+                    .message
+                    .unwrap_or_else(|| "unknown build error".to_string());
+                return Err(anyhow!("docker image build failed: {msg}"));
             }
             if let Some(message) = chunk.stream {
                 debug!(image = %tag, output = %message.trim_end(), "docker build output");
