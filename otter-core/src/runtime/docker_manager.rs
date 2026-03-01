@@ -12,7 +12,7 @@ use bollard::image::BuildImageOptions;
 use bollard::models::{HostConfig, PortBinding};
 use bollard::{Docker, API_DEFAULT_VERSION};
 use bytes::Bytes;
-use futures_util::stream::{self, StreamExt, TryStreamExt};
+use futures_util::stream::{StreamExt, TryStreamExt};
 use tar::Builder;
 use tracing::debug;
 use uuid::Uuid;
@@ -325,11 +325,9 @@ impl DockerRuntimeManager {
             pull: false,
             ..Default::default()
         };
-        let body_stream =
-            stream::once(async move { Ok::<Bytes, std::io::Error>(Bytes::from(context)) });
-        let mut stream = self
-            .docker
-            .build_image(options, None, Some(body_stream.into()));
+
+        let body = hyper::Body::from(context);
+        let mut stream = self.docker.build_image(options, None, Some(body));
         while let Some(chunk) = stream
             .try_next()
             .await
