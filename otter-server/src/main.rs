@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use axum::extract::{Path, Query, State};
+use axum::http::HeaderValue;
 use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::IntoResponse;
@@ -18,6 +19,7 @@ use otter_core::domain::{
 use otter_core::queue::RedisQueue;
 use otter_core::service::OtterService;
 use tokio::time::Duration as TokioDuration;
+use tower_http::cors::{AllowOrigin, CorsLayer};
 use tracing::info;
 use uuid::Uuid;
 
@@ -57,6 +59,21 @@ async fn main() -> Result<()> {
     let service = Arc::new(OtterService::new(&config, database, queue));
     let state = AppState { service };
 
+    let allowed_origins = config
+        .cors_allowed_origins
+        .iter()
+        .map(|origin| origin.parse::<HeaderValue>())
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let cors = CorsLayer::new()
+        .allow_origin(AllowOrigin::list(allowed_origins))
+        .allow_methods([
+            axum::http::Method::GET,
+            axum::http::Method::POST,
+            axum::http::Method::PATCH,
+            axum::http::Method::OPTIONS,
+        ])
+        .allow_headers(tower_http::cors::Any);
+
     let app = Router::new()
         .route("/healthz", get(healthz))
         .route("/v1/projects", post(create_project).get(list_projects))
@@ -75,7 +92,8 @@ async fn main() -> Result<()> {
             axum::routing::patch(update_queue_position),
         )
         .route("/v1/history", get(get_history))
-        .with_state(state);
+        .with_state(state)
+        .layer(cors);
 
     let listener = tokio::net::TcpListener::bind(&config.listen_addr).await?;
     info!("otter-server listening on {}", config.listen_addr);

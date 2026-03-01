@@ -56,6 +56,8 @@ services:
       OTTER_MAX_ATTEMPTS: 5
       OTTER_WORKER_CONCURRENCY: 2
       OTTER_ALLOWED_ROOTS: /workspaces
+      OTTER_CORS_ALLOWED_ORIGINS: http://localhost:5173
+      OTTER_DEFAULT_WORKSPACE_PATH: /workspaces
       RUST_LOG: info
     ports:
       - "8080:8080"
@@ -86,6 +88,7 @@ services:
       OTTER_MIGRATIONS_DIR: /srv/otter/migrations
       OTTER_MAX_ATTEMPTS: 5
       OTTER_ALLOWED_ROOTS: /workspaces
+      OTTER_DEFAULT_WORKSPACE_PATH: /workspaces
       RUST_LOG: info
     volumes:
       - ./workspaces:/workspaces

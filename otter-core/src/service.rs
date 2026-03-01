@@ -26,6 +26,7 @@ pub struct OtterService<Q: Queue> {
     pub workspace_manager: Arc<WorkspaceManager>,
     pub vibe_executor: Arc<VibeExecutor>,
     pub max_attempts: i32,
+    pub default_workspace_path: Option<PathBuf>,
 }
 
 impl<Q: Queue> OtterService<Q> {
@@ -46,6 +47,7 @@ impl<Q: Queue> OtterService<Q> {
             )),
             vibe_executor: Arc::new(VibeExecutor::new(config.vibe_bin.clone())),
             max_attempts: config.max_attempts,
+            default_workspace_path: config.default_workspace_path.clone(),
         }
     }
 
@@ -80,7 +82,20 @@ impl<Q: Queue> OtterService<Q> {
 
     pub async fn enqueue_prompt(&self, request: EnqueuePromptRequest) -> Result<Job> {
         request.validate()?;
-        let job = self.db.create_job(request, self.max_attempts).await?;
+        let workspace_id = match request.workspace_id {
+            Some(workspace_id) => workspace_id,
+            None => self.resolve_default_workspace_id().await?,
+        };
+        let job = self
+            .db
+            .create_job(
+                workspace_id,
+                &request.prompt,
+                request.priority,
+                request.schedule_at,
+                self.max_attempts,
+            )
+            .await?;
         self.db
             .insert_job_event(job.id, "accepted", serde_json::json!({}))
             .await?;
@@ -91,6 +106,58 @@ impl<Q: Queue> OtterService<Q> {
             .insert_job_event(job.id, "queued", serde_json::json!({}))
             .await?;
         Ok(job)
+    }
+
+    async fn resolve_default_workspace_id(&self) -> Result<Uuid> {
+        let fallback_path = self.default_workspace_path.as_ref().ok_or_else(|| {
+            anyhow!("workspace_id is required when OTTER_DEFAULT_WORKSPACE_PATH is not configured")
+        })?;
+        let canonical = self
+            .workspace_manager
+            .validate_workspace_path(fallback_path.as_path())?;
+        let root_path = canonical.to_string_lossy().to_string();
+
+        if let Some(existing) = self.db.find_workspace_by_root_path(&root_path).await? {
+            return Ok(existing.id);
+        }
+
+        const DEFAULT_PROJECT_NAME: &str = "default";
+        const DEFAULT_WORKSPACE_NAME: &str = "default-workspace";
+
+        let project_id =
+            if let Some(project) = self.db.find_project_by_name(DEFAULT_PROJECT_NAME).await? {
+                project.id
+            } else {
+                self.db
+                    .create_project(CreateProjectRequest {
+                        name: DEFAULT_PROJECT_NAME.to_string(),
+                        description: Some(
+                            "Auto-created project for OTTER_DEFAULT_WORKSPACE_PATH".to_string(),
+                        ),
+                    })
+                    .await?
+                    .id
+            };
+
+        let workspace_id = Uuid::new_v4();
+        let isolated_vibe_home = self
+            .workspace_manager
+            .prepare_isolated_vibe_home(workspace_id, &canonical)
+            .await?;
+
+        let workspace = self
+            .db
+            .create_workspace(
+                CreateWorkspaceRequest {
+                    project_id,
+                    name: DEFAULT_WORKSPACE_NAME.to_string(),
+                    root_path,
+                },
+                isolated_vibe_home.display().to_string(),
+            )
+            .await?;
+
+        Ok(workspace.id)
     }
 
     pub async fn process_next_job(&self) -> Result<Option<Uuid>> {

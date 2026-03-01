@@ -23,6 +23,7 @@ pub struct Workspace {
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::Type)]
 #[sqlx(type_name = "job_status", rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
 pub enum JobStatus {
     Queued,
     Running,
@@ -83,7 +84,7 @@ pub struct CreateWorkspaceRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Validate)]
 pub struct EnqueuePromptRequest {
-    pub workspace_id: Uuid,
+    pub workspace_id: Option<Uuid>,
     #[validate(length(min = 1, max = 100_000))]
     pub prompt: String,
     pub priority: Option<i32>,

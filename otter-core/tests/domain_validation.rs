@@ -1,10 +1,12 @@
-use otter_core::domain::{CreateProjectRequest, EnqueuePromptRequest, UpdateQueuePositionRequest};
+use otter_core::domain::{
+    CreateProjectRequest, EnqueuePromptRequest, JobStatus, UpdateQueuePositionRequest,
+};
 use validator::Validate;
 
 #[test]
 fn rejects_empty_prompt() {
     let payload = EnqueuePromptRequest {
-        workspace_id: uuid::Uuid::new_v4(),
+        workspace_id: None,
         prompt: String::new(),
         priority: None,
         schedule_at: None,
@@ -25,4 +27,10 @@ fn accepts_valid_project_name() {
 fn rejects_invalid_queue_priority() {
     let payload = UpdateQueuePositionRequest { priority: 0 };
     assert!(payload.validate().is_err());
+}
+
+#[test]
+fn serializes_failed_job_status() {
+    let value = serde_json::to_string(&JobStatus::Failed).expect("serialize failed status");
+    assert_eq!(value, "\"failed\"");
 }

@@ -5,8 +5,8 @@ use std::path::PathBuf;
 use uuid::Uuid;
 
 use crate::domain::{
-    CreateProjectRequest, CreateWorkspaceRequest, EnqueuePromptRequest, HistoryItem, Job, JobEvent,
-    JobOutput, JobStatus, Project, QueueItem, Workspace,
+    CreateProjectRequest, CreateWorkspaceRequest, HistoryItem, Job, JobEvent, JobOutput, JobStatus,
+    Project, QueueItem, Workspace,
 };
 
 #[derive(Clone)]
@@ -72,6 +72,16 @@ impl Database {
         Ok(records)
     }
 
+    pub async fn find_project_by_name(&self, name: &str) -> Result<Option<Project>> {
+        let project = sqlx::query_as::<_, Project>(
+            "SELECT id, name, description, created_at FROM projects WHERE name = $1 LIMIT 1",
+        )
+        .bind(name)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(project)
+    }
+
     pub async fn create_workspace(
         &self,
         request: CreateWorkspaceRequest,
@@ -102,22 +112,41 @@ impl Database {
         Ok(records)
     }
 
+    pub async fn find_workspace_by_root_path(&self, root_path: &str) -> Result<Option<Workspace>> {
+        let workspace = sqlx::query_as::<_, Workspace>(
+            r#"
+            SELECT id, project_id, name, root_path, isolated_vibe_home, created_at
+            FROM workspaces
+            WHERE root_path = $1
+            ORDER BY created_at DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(root_path)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(workspace)
+    }
+
     pub async fn create_job(
         &self,
-        request: EnqueuePromptRequest,
+        workspace_id: Uuid,
+        prompt: &str,
+        priority: Option<i32>,
+        schedule_at: Option<chrono::DateTime<chrono::Utc>>,
         max_attempts: i32,
     ) -> Result<Job> {
         let job = sqlx::query_as::<_, Job>(
             r#"
             INSERT INTO jobs (workspace_id, prompt, status, priority, schedule_at, attempts, max_attempts)
             VALUES ($1, $2, 'queued', $3, $4, 0, $5)
-            RETURNING id, workspace_id, prompt, status AS "status: JobStatus", priority, schedule_at, attempts, max_attempts, error, created_at, updated_at
+            RETURNING id, workspace_id, prompt, status, priority, schedule_at, attempts, max_attempts, error, created_at, updated_at
             "#,
         )
-        .bind(request.workspace_id)
-        .bind(request.prompt)
-        .bind(request.priority.unwrap_or(100))
-        .bind(request.schedule_at)
+        .bind(workspace_id)
+        .bind(prompt)
+        .bind(priority.unwrap_or(100))
+        .bind(schedule_at)
         .bind(max_attempts)
         .fetch_one(&self.pool)
         .await?;
@@ -127,7 +156,7 @@ impl Database {
     pub async fn fetch_job(&self, job_id: Uuid) -> Result<Option<Job>> {
         let job = sqlx::query_as::<_, Job>(
             r#"
-            SELECT id, workspace_id, prompt, status AS "status: JobStatus", priority, schedule_at, attempts, max_attempts, error, created_at, updated_at
+            SELECT id, workspace_id, prompt, status, priority, schedule_at, attempts, max_attempts, error, created_at, updated_at
             FROM jobs WHERE id = $1
             "#,
         )
@@ -167,7 +196,7 @@ impl Database {
               j.id,
               j.workspace_id,
               j.prompt,
-              j.status AS "status: JobStatus",
+              j.status,
               o.assistant_output,
               j.created_at
             FROM jobs j
@@ -281,7 +310,7 @@ impl Database {
                 updated_at = now()
             FROM next_job
             WHERE j.id = next_job.id
-            RETURNING j.id, j.workspace_id, j.prompt, j.status AS "status: JobStatus", j.priority, j.schedule_at, j.attempts, j.max_attempts, j.error, j.created_at, j.updated_at
+            RETURNING j.id, j.workspace_id, j.prompt, j.status, j.priority, j.schedule_at, j.attempts, j.max_attempts, j.error, j.created_at, j.updated_at
             "#,
         )
         .fetch_optional(&self.pool)
