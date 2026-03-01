@@ -45,9 +45,10 @@ impl VibeExecutor {
         workspace_path: &Path,
         isolated_vibe_home: &Path,
     ) -> Result<VibeExecutionResult> {
+        let effective_prompt = compose_vibe_prompt(prompt);
         let output = Command::new(&self.vibe_bin)
             .arg("--prompt")
-            .arg(prompt)
+            .arg(&effective_prompt)
             .arg("--output")
             .arg("json")
             .arg("--workdir")
@@ -91,9 +92,10 @@ impl VibeExecutor {
         F: FnMut(VibeOutputChunk) -> Fut,
         Fut: Future<Output = Result<()>>,
     {
+        let effective_prompt = compose_vibe_prompt(prompt);
         let mut child = Command::new(&self.vibe_bin)
             .arg("--prompt")
-            .arg(prompt)
+            .arg(&effective_prompt)
             .arg("--output")
             .arg("json")
             .arg("--workdir")
@@ -182,6 +184,20 @@ impl VibeExecutor {
             exit_code,
         })
     }
+}
+
+fn compose_vibe_prompt(user_prompt: &str) -> String {
+    format!(
+        r#"SYSTEM REQUIREMENTS (ALWAYS APPLY):
+- Work in a project-specific subfolder under the current workspace. Never develop directly in workspace root.
+- If needed, create a clear project folder first (for example `projects/<project-name>`), then work only inside it.
+- Ensure dependencies are installed before running/building (detect toolchain and install accordingly: npm/pnpm/yarn, pip/uv/poetry, cargo, etc.).
+- When implementation is complete, start the app/service in background and verify it runs.
+- At the end, print clear run instructions: start command, stop command, and where the project lives.
+
+USER TASK:
+{user_prompt}"#
+    )
 }
 
 fn extract_latest_assistant_message(value: &serde_json::Value) -> Option<String> {
