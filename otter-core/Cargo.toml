@@ -12,6 +12,7 @@ bytes.workspace = true
 chrono.workspace = true
 dotenvy.workspace = true
 futures-util.workspace = true
+http-body-util.workspace = true
 hyper.workspace = true
 redis.workspace = true
 serde.workspace = true
