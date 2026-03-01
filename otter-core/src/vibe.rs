@@ -77,7 +77,7 @@ impl VibeExecutor {
         cmd.arg("--prompt")
             .arg(&effective_prompt)
             .arg("--output")
-            .arg("json")
+            .arg("streaming")
             .arg("--workdir")
             .arg(workspace_path.as_os_str())
             .env("VIBE_HOME", isolated_vibe_home.as_os_str())
@@ -97,9 +97,7 @@ impl VibeExecutor {
             bail!("vibe exited with code {exit_code}: {stderr}");
         }
 
-        let raw_json: serde_json::Value =
-            serde_json::from_str(&stdout).context("vibe output was not valid JSON")?;
-
+        let raw_json = parse_streaming_json_lines(&stdout);
         let assistant_output = extract_latest_assistant_message(&raw_json).unwrap_or_default();
 
         Ok(VibeExecutionResult {
@@ -126,7 +124,7 @@ impl VibeExecutor {
         cmd.arg("--prompt")
             .arg(&effective_prompt)
             .arg("--output")
-            .arg("json")
+            .arg("streaming")
             .arg("--workdir")
             .arg(workspace_path.as_os_str())
             .env("VIBE_HOME", isolated_vibe_home.as_os_str())
@@ -204,8 +202,7 @@ impl VibeExecutor {
             bail!("vibe exited with code {exit_code}: {stderr_buffer}");
         }
 
-        let raw_json: serde_json::Value =
-            serde_json::from_str(&stdout_buffer).context("vibe output was not valid JSON")?;
+        let raw_json = parse_streaming_json_lines(&stdout_buffer);
         let assistant_output = extract_latest_assistant_message(&raw_json).unwrap_or_default();
 
         Ok(VibeExecutionResult {
@@ -223,31 +220,83 @@ fn compose_vibe_prompt(user_prompt: &str) -> String {
 - Work in a project-specific subfolder under the current workspace. Never develop directly in workspace root.
 - If needed, create a clear project folder first (for example `projects/<project-name>`), then work only inside it.
 - Ensure dependencies are installed before running/building (detect toolchain and install accordingly: npm/pnpm/yarn, pip/uv/poetry, cargo, etc.).
+- Always create a production-ready Dockerfile at the project root and use it as the primary run path.
+- Build and run the generated app/service inside Docker (do not run directly on host process as the main path).
+- Verify the container is running and expose the app on a reachable port from the current environment.
 - Always create a setup script named `setup.sh` at the project root that installs and configures everything needed to run the project.
 - Ensure `setup.sh` is executable (`chmod +x setup.sh`) and deterministic/idempotent (safe to run multiple times).
 - When implementation is complete, start the app/service in background and verify it runs.
-- At the end, print clear run instructions: start command, stop command, and where the project lives.
-- Always run the app/service in the background. Give the link to the project in the output.
+- At the end, print clear run instructions: docker build command, docker run command, docker stop/remove command, and where the project lives.
+- Always include where to access the running app (URL/host port) in the final output.
 
 USER TASK:
 {user_prompt}"#
     )
 }
 
+fn parse_streaming_json_lines(stdout: &str) -> serde_json::Value {
+    let entries = stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            serde_json::from_str::<serde_json::Value>(line)
+                .unwrap_or_else(|_| serde_json::json!({ "type": "raw_line", "content": line }))
+        })
+        .collect::<Vec<_>>();
+    serde_json::Value::Array(entries)
+}
+
 fn extract_latest_assistant_message(value: &serde_json::Value) -> Option<String> {
     let messages = value.as_array()?;
-    messages.iter().rev().find_map(|msg| {
-        let role = msg.get("role")?.as_str()?;
-        if role != "assistant" {
-            return None;
+    messages
+        .iter()
+        .rev()
+        .find_map(extract_assistant_content_from_entry)
+}
+
+fn extract_assistant_content_from_entry(entry: &serde_json::Value) -> Option<String> {
+    let role = entry
+        .get("role")
+        .or_else(|| entry.pointer("/message/role"))
+        .or_else(|| entry.pointer("/delta/role"))
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    if role != "assistant" {
+        return None;
+    }
+    value_to_text(
+        entry
+            .get("content")
+            .or_else(|| entry.pointer("/message/content"))
+            .or_else(|| entry.pointer("/delta/content"))?,
+    )
+}
+
+fn value_to_text(value: &serde_json::Value) -> Option<String> {
+    if let Some(content) = value.as_str() {
+        return Some(content.to_string());
+    }
+    if let Some(array) = value.as_array() {
+        let joined = array
+            .iter()
+            .filter_map(|item| {
+                item.as_str()
+                    .map(ToString::to_string)
+                    .or_else(|| item.get("text").and_then(|v| v.as_str()).map(ToString::to_string))
+            })
+            .collect::<Vec<_>>()
+            .join("");
+        if !joined.is_empty() {
+            return Some(joined);
         }
-        msg.get("content")?.as_str().map(ToString::to_string)
-    })
+    }
+    None
 }
 
 #[cfg(test)]
 mod tests {
-    use super::extract_latest_assistant_message;
+    use super::{extract_latest_assistant_message, parse_streaming_json_lines};
 
     #[test]
     fn finds_last_assistant_message() {
@@ -258,5 +307,23 @@ mod tests {
         ]);
         let content = extract_latest_assistant_message(&payload);
         assert_eq!(content.as_deref(), Some("two"));
+    }
+
+    #[test]
+    fn parses_streaming_json_lines_as_array() {
+        let raw = r#"{"role":"assistant","content":"hello"}
+{"role":"assistant","content":"world"}"#;
+        let parsed = parse_streaming_json_lines(raw);
+        assert_eq!(parsed.as_array().map(|v| v.len()), Some(2));
+    }
+
+    #[test]
+    fn extracts_assistant_from_nested_message_shape() {
+        let payload = serde_json::json!([
+            {"type":"message","message":{"role":"assistant","content":"from-message"}},
+            {"type":"delta","delta":{"role":"assistant","content":"from-delta"}}
+        ]);
+        let content = extract_latest_assistant_message(&payload);
+        assert_eq!(content.as_deref(), Some("from-delta"));
     }
 }
