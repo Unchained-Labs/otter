@@ -18,4 +18,5 @@ tracing-subscriber.workspace = true
 tower-http.workspace = true
 uuid.workspace = true
 validator.workspace = true
+reqwest.workspace = true
 otter-core = { path = "../otter-core" }

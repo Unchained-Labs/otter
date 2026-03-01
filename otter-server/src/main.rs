@@ -5,7 +5,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 
 use anyhow::Result;
-use axum::extract::{Path, Query, State};
+use axum::extract::{Multipart, Path, Query, State};
 use axum::http::HeaderValue;
 use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -31,6 +31,7 @@ use uuid::Uuid;
 #[derive(Clone)]
 struct AppState {
     service: Arc<OtterService<RedisQueue>>,
+    lavoix_url: String,
 }
 
 #[derive(serde::Deserialize)]
@@ -57,6 +58,14 @@ struct WorkspaceFileQuery {
 
 #[derive(serde::Deserialize)]
 struct WorkspaceCommandRequest {
+    command: String,
+    working_directory: Option<String>,
+    timeout_seconds: Option<u64>,
+}
+
+#[derive(serde::Deserialize)]
+struct WorkspaceCommandDispatchRequest {
+    workspace_id: Option<Uuid>,
     command: String,
     working_directory: Option<String>,
     timeout_seconds: Option<u64>,
@@ -104,6 +113,17 @@ struct JobResponse {
     queue_rank: Option<i64>,
 }
 
+#[derive(serde::Deserialize)]
+struct LavoixTranscriptionResponse {
+    text: String,
+}
+
+#[derive(serde::Serialize)]
+struct VoiceEnqueueResponse {
+    transcript: String,
+    job: Job,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -115,7 +135,10 @@ async fn main() -> Result<()> {
     migrate_with_retry(database.clone()).await?;
     let queue = connect_redis_with_retry(&config.redis_url).await?;
     let service = Arc::new(OtterService::new(&config, database, queue));
-    let state = AppState { service };
+    let state = AppState {
+        service,
+        lavoix_url: config.lavoix_url.clone(),
+    };
 
     let allow_any_origin = config
         .cors_allowed_origins
@@ -149,7 +172,9 @@ async fn main() -> Result<()> {
         .route("/v1/workspaces/{id}/tree", get(get_workspace_tree))
         .route("/v1/workspaces/{id}/file", get(get_workspace_file))
         .route("/v1/workspaces/{id}/command", post(run_workspace_command))
+        .route("/v1/workspaces/command", post(run_workspace_command_any))
         .route("/v1/prompts", post(enqueue_prompt))
+        .route("/v1/voice/prompts", post(enqueue_voice_prompt))
         .route("/v1/jobs/{id}", get(get_job))
         .route("/v1/jobs/{id}/events", get(get_job_events))
         .route("/v1/events/stream", get(stream_job_events))
@@ -336,6 +361,33 @@ async fn run_workspace_command(
     Path(id): Path<Uuid>,
     Json(body): Json<WorkspaceCommandRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    execute_workspace_command(state, Some(id), body)
+        .await
+        .map(Json)
+}
+
+async fn run_workspace_command_any(
+    State(state): State<AppState>,
+    Json(body): Json<WorkspaceCommandDispatchRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    execute_workspace_command(
+        state,
+        body.workspace_id,
+        WorkspaceCommandRequest {
+            command: body.command,
+            working_directory: body.working_directory,
+            timeout_seconds: body.timeout_seconds,
+        },
+    )
+    .await
+    .map(Json)
+}
+
+async fn execute_workspace_command(
+    state: AppState,
+    workspace_id: Option<Uuid>,
+    body: WorkspaceCommandRequest,
+) -> Result<WorkspaceCommandResponse, (StatusCode, String)> {
     if body.command.trim().is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -343,10 +395,16 @@ async fn run_workspace_command(
         ));
     }
 
+    let resolved_workspace_id = state
+        .service
+        .resolve_workspace_id_or_default(workspace_id)
+        .await
+        .map_err(internal_error)?;
+
     let workspace = state
         .service
         .db
-        .fetch_workspace(id)
+        .fetch_workspace(resolved_workspace_id)
         .await
         .map_err(internal_error)?
         .ok_or((StatusCode::NOT_FOUND, "workspace not found".to_string()))?;
@@ -356,7 +414,7 @@ async fn run_workspace_command(
     let timeout_seconds = body.timeout_seconds.unwrap_or(30).clamp(1, 300);
 
     info!(
-        workspace_id = %id,
+        workspace_id = %resolved_workspace_id,
         cwd = %cwd.display(),
         timeout_seconds,
         command = %body.command,
@@ -379,7 +437,7 @@ async fn run_workspace_command(
     let timed_out = output.status.code() == Some(124);
     if timed_out {
         warn!(
-            workspace_id = %id,
+            workspace_id = %resolved_workspace_id,
             cwd = %cwd.display(),
             timeout_seconds,
             command = %body.command,
@@ -387,15 +445,15 @@ async fn run_workspace_command(
         );
     }
 
-    Ok(Json(WorkspaceCommandResponse {
-        workspace_id: id,
+    Ok(WorkspaceCommandResponse {
+        workspace_id: resolved_workspace_id,
         command: body.command,
         working_directory: cwd.display().to_string(),
         exit_code: output.status.code(),
         stdout: String::from_utf8_lossy(&output.stdout).to_string(),
         stderr: String::from_utf8_lossy(&output.stderr).to_string(),
         timed_out,
-    }))
+    })
 }
 
 async fn enqueue_prompt(
@@ -408,6 +466,159 @@ async fn enqueue_prompt(
         .await
         .map(|job| (StatusCode::ACCEPTED, Json(job)))
         .map_err(internal_error)
+}
+
+async fn enqueue_voice_prompt(
+    State(state): State<AppState>,
+    mut multipart: Multipart,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let mut workspace_id: Option<Uuid> = None;
+    let mut language: Option<String> = None;
+    let mut provider: Option<String> = None;
+    let mut file_name = "audio.webm".to_string();
+    let mut content_type = "audio/webm".to_string();
+    let mut audio_bytes: Option<Vec<u8>> = None;
+
+    while let Some(field) = multipart.next_field().await.map_err(internal_error)? {
+        let name = field.name().unwrap_or_default().to_string();
+        match name.as_str() {
+            "file" | "audio" => {
+                if let Some(filename) = field.file_name() {
+                    file_name = filename.to_string();
+                }
+                if let Some(ct) = field.content_type() {
+                    content_type = ct.to_string();
+                }
+                let bytes = field.bytes().await.map_err(internal_error)?;
+                audio_bytes = Some(bytes.to_vec());
+            }
+            "workspace_id" => {
+                let value = field.text().await.map_err(internal_error)?;
+                if !value.trim().is_empty() {
+                    workspace_id = Some(Uuid::parse_str(value.trim()).map_err(|e| {
+                        (
+                            StatusCode::BAD_REQUEST,
+                            format!("invalid workspace_id: {e}"),
+                        )
+                    })?);
+                }
+            }
+            "language" => {
+                let value = field.text().await.map_err(internal_error)?;
+                if !value.trim().is_empty() {
+                    language = Some(value);
+                }
+            }
+            "provider" => {
+                let value = field.text().await.map_err(internal_error)?;
+                if !value.trim().is_empty() {
+                    provider = Some(value);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let audio = audio_bytes.ok_or((
+        StatusCode::BAD_REQUEST,
+        "multipart payload must include file".to_string(),
+    ))?;
+    if audio.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "audio payload is empty".to_string(),
+        ));
+    }
+
+    let transcript = transcribe_with_lavoix(
+        &state.lavoix_url,
+        audio,
+        file_name,
+        content_type,
+        language,
+        provider,
+    )
+    .await?;
+    let prompt = transcript.trim().to_string();
+    if prompt.is_empty() {
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            "lavoix returned an empty transcript".to_string(),
+        ));
+    }
+
+    let job = state
+        .service
+        .enqueue_prompt(EnqueuePromptRequest {
+            workspace_id,
+            prompt: prompt.clone(),
+            priority: None,
+            schedule_at: None,
+        })
+        .await
+        .map_err(internal_error)?;
+
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(VoiceEnqueueResponse {
+            transcript: prompt,
+            job,
+        }),
+    ))
+}
+
+async fn transcribe_with_lavoix(
+    lavoix_url: &str,
+    audio_bytes: Vec<u8>,
+    file_name: String,
+    content_type: String,
+    language: Option<String>,
+    provider: Option<String>,
+) -> Result<String, (StatusCode, String)> {
+    let part = reqwest::multipart::Part::bytes(audio_bytes)
+        .file_name(file_name)
+        .mime_str(&content_type)
+        .map_err(internal_error)?;
+    let mut form = reqwest::multipart::Form::new().part("file", part);
+    if let Some(language) = language {
+        form = form.text("language", language);
+    }
+    if let Some(provider) = provider {
+        form = form.text("provider", provider);
+    }
+
+    let url = format!("{}/v1/stt/transcribe", lavoix_url.trim_end_matches('/'));
+    let response = reqwest::Client::new()
+        .post(url)
+        .multipart(form)
+        .send()
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::BAD_GATEWAY,
+                format!("lavoix request failed: {error}"),
+            )
+        })?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            format!("lavoix returned {status}: {body}"),
+        ));
+    }
+
+    let payload = response
+        .json::<LavoixTranscriptionResponse>()
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::BAD_GATEWAY,
+                format!("invalid lavoix response: {error}"),
+            )
+        })?;
+    Ok(payload.text)
 }
 
 async fn get_job(
