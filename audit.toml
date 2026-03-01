@@ -1,0 +1,5 @@
+[advisories]
+ignore = [
+  # sqlx derive pulls sqlx-mysql as a build-time dependency; otter only enables Postgres runtime.
+  "RUSTSEC-2023-0071",
+]

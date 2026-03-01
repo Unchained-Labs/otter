@@ -1,0 +1,100 @@
+version: "3.9"
+
+services:
+  postgres:
+    image: postgres:16
+    container_name: otter-postgres
+    environment:
+      POSTGRES_DB: otter
+      POSTGRES_USER: otter
+      POSTGRES_PASSWORD: otter
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U otter -d otter"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: otter-redis
+    ports:
+      - "6379:6379"
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  otter-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        BIN_NAME: otter-server
+    container_name: otter-server
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      OTTER_DATABASE_URL: postgres://otter:otter@postgres:5432/otter
+      OTTER_REDIS_URL: redis://redis:6379
+      OTTER_LISTEN_ADDR: 0.0.0.0:8080
+      OTTER_VIBE_BIN: vibe
+      OTTER_VIBE_HOME_BASE: /var/lib/otter/vibe
+      OTTER_MIGRATIONS_DIR: /srv/otter/migrations
+      OTTER_MAX_ATTEMPTS: 5
+      OTTER_WORKER_CONCURRENCY: 2
+      OTTER_ALLOWED_ROOTS: /workspaces
+      OTTER_CORS_ALLOWED_ORIGINS: http://localhost:5173
+      OTTER_DEFAULT_WORKSPACE_PATH: /workspaces
+      RUST_LOG: info
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./workspaces:/workspaces
+      - vibe_state:/var/lib/otter/vibe
+
+  otter-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        BIN_NAME: otter-worker
+    container_name: otter-worker
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    env_file:
+      - .env
+    command: ["/usr/local/bin/otter-worker"]
+    environment:
+      OTTER_DATABASE_URL: postgres://otter:otter@postgres:5432/otter
+      OTTER_REDIS_URL: redis://redis:6379
+      OTTER_VIBE_BIN: vibe
+      OTTER_VIBE_HOME_BASE: /var/lib/otter/vibe
+      OTTER_MIGRATIONS_DIR: /srv/otter/migrations
+      OTTER_MAX_ATTEMPTS: 5
+      OTTER_ALLOWED_ROOTS: /workspaces
+      OTTER_DEFAULT_WORKSPACE_PATH: /workspaces
+      RUST_LOG: info
+    volumes:
+      - ./workspaces:/workspaces
+      - vibe_state:/var/lib/otter/vibe
+
+volumes:
+  postgres_data:
+  redis_data:
+  vibe_state:
