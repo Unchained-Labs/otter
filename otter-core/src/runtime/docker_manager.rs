@@ -2,18 +2,18 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::{anyhow, Context, Result};
-use bollard::container::{
-    Config as ContainerConfig, CreateContainerOptions, InspectContainerOptions,
-    ListContainersOptions, LogOutput, LogsOptions, RemoveContainerOptions, RestartContainerOptions,
-    StartContainerOptions, StopContainerOptions,
-};
+use bollard::body_full;
+use bollard::container::{InspectContainerOptions, LogOutput, StartContainerOptions};
 use bollard::exec::{CreateExecOptions, StartExecOptions, StartExecResults};
-use bollard::image::BuildImageOptions;
-use bollard::models::{HostConfig, PortBinding};
+use bollard::models::{ContainerCreateBody, HostConfig, PortBinding};
+use bollard::query_parameters::{
+    BuildImageOptionsBuilder, CreateContainerOptionsBuilder, ListContainersOptionsBuilder,
+    LogsOptionsBuilder, RemoveContainerOptionsBuilder, RestartContainerOptionsBuilder,
+    StopContainerOptionsBuilder,
+};
 use bollard::{Docker, API_DEFAULT_VERSION};
 use bytes::Bytes;
 use futures_util::stream::{StreamExt, TryStreamExt};
-use http_body_util::Full;
 use tar::Builder;
 use tracing::debug;
 use uuid::Uuid;
@@ -78,26 +78,23 @@ impl DockerRuntimeManager {
             .await?
             .is_some()
         {
+            let remove_opts = RemoveContainerOptionsBuilder::default()
+                .force(true)
+                .v(true)
+                .build();
             self.docker
-                .remove_container(
-                    &container_name,
-                    Some(RemoveContainerOptions {
-                        force: true,
-                        v: true,
-                        link: false,
-                    }),
-                )
+                .remove_container(&container_name, Some(remove_opts))
                 .await
                 .with_context(|| format!("failed to remove previous container {container_name}"))?;
         }
 
+        let create_opts = CreateContainerOptionsBuilder::default()
+            .name(&container_name)
+            .build();
         self.docker
             .create_container(
-                Some(CreateContainerOptions {
-                    name: container_name.clone(),
-                    platform: None,
-                }),
-                ContainerConfig {
+                Some(create_opts),
+                ContainerCreateBody {
                     image: Some(image_tag.clone()),
                     tty: Some(true),
                     host_config: Some(HostConfig {
@@ -112,7 +109,7 @@ impl DockerRuntimeManager {
             .with_context(|| format!("failed to create runtime container {container_name}"))?;
 
         self.docker
-            .start_container(&container_name, None::<StartContainerOptions<String>>)
+            .start_container(&container_name, None::<StartContainerOptions>)
             .await
             .with_context(|| format!("failed to start runtime container {container_name}"))?;
 
@@ -181,7 +178,7 @@ impl DockerRuntimeManager {
     ) -> Result<RuntimeContainerInfo> {
         let container_name = self.container_name_for(workspace_id);
         self.docker
-            .start_container(&container_name, None::<StartContainerOptions<String>>)
+            .start_container(&container_name, None::<StartContainerOptions>)
             .await
             .with_context(|| format!("failed to start container {container_name}"))?;
         self.runtime_status(workspace_id).await
@@ -192,8 +189,9 @@ impl DockerRuntimeManager {
         workspace_id: Uuid,
     ) -> Result<RuntimeContainerInfo> {
         let container_name = self.container_name_for(workspace_id);
+        let stop_opts = StopContainerOptionsBuilder::default().t(10).build();
         self.docker
-            .stop_container(&container_name, Some(StopContainerOptions { t: 10 }))
+            .stop_container(&container_name, Some(stop_opts))
             .await
             .with_context(|| format!("failed to stop container {container_name}"))?;
         self.runtime_status(workspace_id).await
@@ -204,8 +202,9 @@ impl DockerRuntimeManager {
         workspace_id: Uuid,
     ) -> Result<RuntimeContainerInfo> {
         let container_name = self.container_name_for(workspace_id);
+        let restart_opts = RestartContainerOptionsBuilder::default().t(10).build();
         self.docker
-            .restart_container(&container_name, Some(RestartContainerOptions { t: 10 }))
+            .restart_container(&container_name, Some(restart_opts))
             .await
             .with_context(|| format!("failed to restart container {container_name}"))?;
         self.runtime_status(workspace_id).await
@@ -213,16 +212,13 @@ impl DockerRuntimeManager {
 
     pub async fn logs_for_workspace(&self, workspace_id: Uuid, tail: usize) -> Result<String> {
         let container_name = self.container_name_for(workspace_id);
-        let mut stream = self.docker.logs(
-            &container_name,
-            Some(LogsOptions::<String> {
-                stdout: true,
-                stderr: true,
-                follow: false,
-                tail: tail.to_string(),
-                ..Default::default()
-            }),
-        );
+        let logs_opts = LogsOptionsBuilder::default()
+            .stdout(true)
+            .stderr(true)
+            .follow(false)
+            .tail(tail.to_string())
+            .build();
+        let mut stream = self.docker.logs(&container_name, Some(logs_opts));
 
         let mut chunks = Vec::new();
         while let Some(item) = stream.next().await {
@@ -268,14 +264,7 @@ impl DockerRuntimeManager {
         let mut stderr = String::new();
         if let StartExecResults::Attached { mut output, .. } = self
             .docker
-            .start_exec(
-                &exec.id,
-                Some(StartExecOptions {
-                    detach: false,
-                    tty: false,
-                    output_capacity: None,
-                }),
-            )
+            .start_exec(&exec.id, None::<StartExecOptions>)
             .await
             .with_context(|| format!("failed to start exec for container {container_name}"))?
         {
@@ -319,16 +308,15 @@ impl DockerRuntimeManager {
         }
 
         let context = tar_workspace(workspace_root)?;
-        let options = BuildImageOptions {
-            dockerfile: "Dockerfile".to_string(),
-            t: tag.to_string(),
-            rm: true,
-            pull: false,
-            ..Default::default()
-        };
+        let options = BuildImageOptionsBuilder::default()
+            .dockerfile("Dockerfile")
+            .t(tag)
+            .rm(true)
+            .build();
 
-        let body = Full::new(Bytes::from(context));
-        let mut stream = self.docker.build_image(options, None, Some(body));
+        let mut stream = self
+            .docker
+            .build_image(options, None, Some(body_full(Bytes::from(context))));
         while let Some(chunk) = stream
             .try_next()
             .await
@@ -364,13 +352,10 @@ impl DockerRuntimeManager {
     }
 
     pub async fn prune_stale_containers(&self) -> Result<()> {
-        let containers = self
-            .docker
-            .list_containers(Some(ListContainersOptions::<String> {
-                all: true,
-                ..Default::default()
-            }))
-            .await?;
+        let list_opts = ListContainersOptionsBuilder::default()
+            .all(true)
+            .build();
+        let containers = self.docker.list_containers(Some(list_opts)).await?;
         for container in containers {
             let Some(names) = container.names else {
                 continue;
@@ -383,16 +368,13 @@ impl DockerRuntimeManager {
                 continue;
             }
             if let Some(id) = container.id {
+                let remove_opts = RemoveContainerOptionsBuilder::default()
+                    .force(true)
+                    .v(true)
+                    .build();
                 let _ = self
                     .docker
-                    .remove_container(
-                        &id,
-                        Some(RemoveContainerOptions {
-                            force: true,
-                            v: true,
-                            link: false,
-                        }),
-                    )
+                    .remove_container(&id, Some(remove_opts))
                     .await;
             }
         }
