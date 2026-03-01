@@ -143,7 +143,7 @@ impl Database {
             r#"
             INSERT INTO jobs (workspace_id, prompt, status, priority, schedule_at, attempts, max_attempts)
             VALUES ($1, $2, 'queued', $3, $4, 0, $5)
-            RETURNING id, workspace_id, prompt, status, priority, schedule_at, attempts, max_attempts, error, created_at, updated_at
+            RETURNING id, workspace_id, prompt, preview_url, is_paused, status, priority, schedule_at, attempts, max_attempts, error, created_at, updated_at
             "#,
         )
         .bind(workspace_id)
@@ -159,7 +159,7 @@ impl Database {
     pub async fn fetch_job(&self, job_id: Uuid) -> Result<Option<Job>> {
         let job = sqlx::query_as::<_, Job>(
             r#"
-            SELECT id, workspace_id, prompt, status, priority, schedule_at, attempts, max_attempts, error, created_at, updated_at
+            SELECT id, workspace_id, prompt, preview_url, is_paused, status, priority, schedule_at, attempts, max_attempts, error, created_at, updated_at
             FROM jobs WHERE id = $1
             "#,
         )
@@ -294,8 +294,9 @@ impl Database {
                 updated_at = now()
             WHERE j.id = $1
               AND j.status = 'queued'
+              AND j.is_paused = false
               AND (j.schedule_at IS NULL OR j.schedule_at <= now())
-            RETURNING j.id, j.workspace_id, j.prompt, j.status, j.priority, j.schedule_at, j.attempts, j.max_attempts, j.error, j.created_at, j.updated_at
+            RETURNING j.id, j.workspace_id, j.prompt, j.preview_url, j.is_paused, j.status, j.priority, j.schedule_at, j.attempts, j.max_attempts, j.error, j.created_at, j.updated_at
             "#,
         )
         .bind(job_id)
@@ -418,6 +419,7 @@ impl Database {
                 id AS job_id,
                 workspace_id,
                 prompt,
+                is_paused,
                 priority,
                 schedule_at,
                 queue_rank,
@@ -427,6 +429,7 @@ impl Database {
                     id,
                     workspace_id,
                     prompt,
+                    is_paused,
                     priority,
                     schedule_at,
                     created_at,
@@ -435,7 +438,7 @@ impl Database {
                     ) AS queue_rank
                 FROM jobs
                 WHERE status = 'queued'
-                  AND (schedule_at IS NULL OR schedule_at <= now())
+                  AND (schedule_at IS NULL OR schedule_at <= now() OR is_paused = true)
             ) queued
             ORDER BY queue_rank ASC
             LIMIT $1 OFFSET $2
@@ -459,6 +462,51 @@ impl Database {
         )
         .bind(job_id)
         .bind(priority)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    pub async fn pause_queued_job(&self, job_id: Uuid) -> Result<bool> {
+        let result = sqlx::query(
+            r#"
+            UPDATE jobs
+            SET is_paused = true, updated_at = now()
+            WHERE id = $1
+              AND status = 'queued'
+            "#,
+        )
+        .bind(job_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    pub async fn resume_queued_job(&self, job_id: Uuid) -> Result<bool> {
+        let result = sqlx::query(
+            r#"
+            UPDATE jobs
+            SET is_paused = false, updated_at = now()
+            WHERE id = $1
+              AND status = 'queued'
+            "#,
+        )
+        .bind(job_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    pub async fn set_job_preview_url(&self, job_id: Uuid, preview_url: &str) -> Result<bool> {
+        let result = sqlx::query(
+            r#"
+            UPDATE jobs
+            SET preview_url = $2, updated_at = now()
+            WHERE id = $1
+            "#,
+        )
+        .bind(job_id)
+        .bind(preview_url)
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected() > 0)

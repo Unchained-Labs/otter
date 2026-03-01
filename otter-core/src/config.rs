@@ -17,6 +17,7 @@ pub struct AppConfig {
     pub default_workspace_path: Option<PathBuf>,
     pub default_workspace_subdir: String,
     pub lavoix_url: String,
+    pub otter_api_base_url: String,
     pub max_attempts: i32,
     pub worker_concurrency: usize,
     pub runtime: RuntimeConfig,
@@ -82,6 +83,8 @@ impl AppConfig {
                 .unwrap_or_else(|_| "auto".to_string()),
             lavoix_url: env::var("OTTER_LAVOIX_URL")
                 .unwrap_or_else(|_| "http://lavoix:8090".to_string()),
+            otter_api_base_url: env::var("OTTER_API_BASE_URL")
+                .unwrap_or_else(|_| "http://otter-server:8080".to_string()),
             max_attempts: env::var("OTTER_MAX_ATTEMPTS")
                 .ok()
                 .and_then(|value| value.parse().ok())

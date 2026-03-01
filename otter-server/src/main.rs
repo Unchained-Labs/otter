@@ -159,6 +159,11 @@ struct VoiceEnqueueResponse {
     job: Job,
 }
 
+#[derive(serde::Deserialize)]
+struct SetJobPreviewUrlRequest {
+    preview_url: String,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -237,6 +242,9 @@ async fn main() -> Result<()> {
         .route("/v1/voice/prompts", post(enqueue_voice_prompt))
         .route("/v1/jobs/{id}", get(get_job))
         .route("/v1/jobs/{id}/events", get(get_job_events))
+        .route("/v1/jobs/{id}/preview-url", post(set_job_preview_url))
+        .route("/v1/jobs/{id}/pause", post(pause_job))
+        .route("/v1/jobs/{id}/resume", post(resume_job))
         .route("/v1/events/stream", get(stream_job_events))
         .route("/v1/jobs/{id}/cancel", post(cancel_job))
         .route("/v1/queue", get(get_queue))
@@ -638,21 +646,32 @@ async fn execute_workspace_command(
         .map(|value| value.chars().take(120).collect::<String>());
     if state.service.runtime_enabled() {
         let session_id = shell_session_id.as_deref().unwrap_or("workspace-shell");
-        let result = state
+        match state
             .service
             .runtime_exec_for_workspace(resolved_workspace_id, session_id, &body.command)
             .await
-            .map_err(internal_error)?;
-        return Ok(WorkspaceCommandResponse {
-            workspace_id: resolved_workspace_id,
-            command: body.command,
-            working_directory: result.cwd,
-            shell_session_id,
-            exit_code: Some(result.exit_code as i32),
-            stdout: result.stdout,
-            stderr: result.stderr,
-            timed_out: false,
-        });
+        {
+            Ok(result) => {
+                return Ok(WorkspaceCommandResponse {
+                    workspace_id: resolved_workspace_id,
+                    command: body.command,
+                    working_directory: result.cwd,
+                    shell_session_id,
+                    exit_code: Some(result.exit_code as i32),
+                    stdout: result.stdout,
+                    stderr: result.stderr,
+                    timed_out: false,
+                });
+            }
+            Err(error) => {
+                warn!(
+                    workspace_id = %resolved_workspace_id,
+                    command = %body.command,
+                    error = %error,
+                    "runtime command failed; falling back to host workspace shell"
+                );
+            }
+        }
     }
 
     let session_key = shell_session_id
@@ -939,6 +958,75 @@ async fn cancel_job(
     if !cancelled {
         return Err((StatusCode::NOT_FOUND, "job not cancellable".into()));
     }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn pause_job(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let paused = state.service.pause_job(id).await.map_err(internal_error)?;
+    if !paused {
+        return Err((StatusCode::NOT_FOUND, "queued job not found".into()));
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn resume_job(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let resumed = state.service.resume_job(id).await.map_err(internal_error)?;
+    if !resumed {
+        return Err((StatusCode::NOT_FOUND, "paused queued job not found".into()));
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn set_job_preview_url(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(body): Json<SetJobPreviewUrlRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let preview_url = body.preview_url.trim();
+    if preview_url.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "preview_url must not be empty".to_string(),
+        ));
+    }
+    let parsed = reqwest::Url::parse(preview_url).map_err(|error| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("preview_url must be a valid absolute URL: {error}"),
+        )
+    })?;
+    if parsed.scheme() != "http" && parsed.scheme() != "https" {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "preview_url must use http or https".to_string(),
+        ));
+    }
+
+    let updated = state
+        .service
+        .db
+        .set_job_preview_url(id, preview_url)
+        .await
+        .map_err(internal_error)?;
+    if !updated {
+        return Err((StatusCode::NOT_FOUND, "job not found".to_string()));
+    }
+    state
+        .service
+        .db
+        .insert_job_event(
+            id,
+            "preview_url_set",
+            serde_json::json!({ "preview_url": preview_url }),
+        )
+        .await
+        .map_err(internal_error)?;
     Ok(StatusCode::NO_CONTENT)
 }
 

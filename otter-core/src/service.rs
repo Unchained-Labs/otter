@@ -10,7 +10,7 @@ use chrono::Utc;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::Mutex;
-use tokio::time::sleep;
+use tokio::time::{interval, sleep, Duration as TokioDuration, MissedTickBehavior};
 use tracing::{info, warn};
 use uuid::Uuid;
 use validator::Validate;
@@ -19,7 +19,8 @@ use crate::config::AppConfig;
 use crate::db::Database;
 use crate::domain::{
     CreateProjectRequest, CreateWorkspaceRequest, EnqueuePromptRequest, Job, JobEvent, JobStatus,
-    Project, QueueItem, RuntimeContainerInfo, UpdateQueuePositionRequest, Workspace,
+    Project, QueueItem, RuntimeContainerInfo, RuntimeContainerStatus, UpdateQueuePositionRequest,
+    Workspace,
 };
 use crate::queue::{Queue, QueueMessage};
 use crate::runtime::docker_manager::{DockerRuntimeManager, RuntimeExecResult};
@@ -60,6 +61,7 @@ impl<Q: Queue> OtterService<Q> {
             )),
             vibe_executor: Arc::new(VibeExecutor::new(
                 config.vibe_bin.clone(),
+                config.otter_api_base_url.clone(),
                 config.vibe_model.clone(),
                 config.vibe_provider.clone(),
                 config.vibe_extra_env.clone(),
@@ -315,8 +317,10 @@ impl<Q: Queue> OtterService<Q> {
                         .schedule_at
                         .map(|at| at > Utc::now())
                         .unwrap_or(false);
-                if should_requeue_for_schedule {
-                    info!(job_id = %message.job_id, "job scheduled in future; requeued message");
+                let should_requeue_for_pause =
+                    matches!(job_state.status, JobStatus::Queued) && job_state.is_paused;
+                if should_requeue_for_schedule || should_requeue_for_pause {
+                    info!(job_id = %message.job_id, "job not runnable yet; requeued message");
                     self.queue
                         .enqueue(
                             DEFAULT_QUEUE_NAME,
@@ -328,7 +332,8 @@ impl<Q: Queue> OtterService<Q> {
                     info!(
                         job_id = %message.job_id,
                         schedule_at = ?job_state.schedule_at,
-                        "job is scheduled in the future; re-queued"
+                        is_paused = job_state.is_paused,
+                        "job is not runnable yet; re-queued"
                     );
                 }
             }
@@ -439,6 +444,7 @@ impl<Q: Queue> OtterService<Q> {
             .vibe_executor
             .run_prompt_streaming(
                 &job.prompt,
+                job.id,
                 &workspace_path,
                 &isolated_vibe_home,
                 |chunk: VibeOutputChunk| {
@@ -457,6 +463,10 @@ impl<Q: Queue> OtterService<Q> {
                             .await?;
                         Ok(())
                     }
+                },
+                || async {
+                    let status = self.db.fetch_job(job.id).await?.map(|value| value.status);
+                    Ok(matches!(status, Some(JobStatus::Cancelled)))
                 },
             )
             .await?;
@@ -586,6 +596,8 @@ impl<Q: Queue> OtterService<Q> {
         let mut stdout_lines = BufReader::new(stdout).lines();
         let mut stderr_lines = BufReader::new(stderr).lines();
         let mut line_count: usize = 0;
+        let mut cancel_poll = interval(TokioDuration::from_millis(400));
+        cancel_poll.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
         loop {
             tokio::select! {
@@ -623,6 +635,14 @@ impl<Q: Queue> OtterService<Q> {
                                 .await?;
                         }
                         None => break,
+                    }
+                }
+                _ = cancel_poll.tick() => {
+                    let status = self.db.fetch_job(job_id).await?.map(|job| job.status);
+                    if matches!(status, Some(JobStatus::Cancelled)) {
+                        let _ = child.kill().await;
+                        let _ = child.wait().await;
+                        return Err(anyhow!("job cancelled while setup.sh was running"));
                     }
                 }
             }
@@ -799,13 +819,47 @@ impl<Q: Queue> OtterService<Q> {
             .as_ref()
             .ok_or_else(|| anyhow!("runtime is not enabled"))?;
         let key = build_shell_session_key(workspace_id, session_id);
-        let cwd = {
+        let mut retry_cwd = {
             let sessions = self.runtime_shell_cwds.lock().await;
             sessions.get(&key).cloned()
         };
-        let result = runtime
-            .exec_in_workspace(workspace_id, command, cwd.as_deref())
-            .await?;
+        let result = match runtime
+            .exec_in_workspace(workspace_id, command, retry_cwd.as_deref())
+            .await
+        {
+            Ok(result) => result,
+            Err(initial_error) => {
+                let status = runtime.runtime_status(workspace_id).await?;
+                match status.status {
+                    RuntimeContainerStatus::Running => return Err(initial_error),
+                    RuntimeContainerStatus::Stopped => {
+                        runtime.start_workspace_container(workspace_id).await?;
+                    }
+                    RuntimeContainerStatus::Missing => {
+                        let workspace = self
+                            .db
+                            .fetch_workspace(workspace_id)
+                            .await?
+                            .ok_or_else(|| anyhow!("workspace not found: {workspace_id}"))?;
+                        runtime
+                            .ensure_workspace_container(workspace_id, Path::new(&workspace.root_path))
+                            .await?;
+                        // New container starts from default cwd; clear any stale cwd from prior session.
+                        let mut sessions = self.runtime_shell_cwds.lock().await;
+                        sessions.remove(&key);
+                        retry_cwd = None;
+                    }
+                }
+                runtime
+                    .exec_in_workspace(workspace_id, command, retry_cwd.as_deref())
+                    .await
+                    .map_err(|retry_error| {
+                        anyhow!(
+                            "failed to execute command in runtime container after recovery (first error: {initial_error}; retry error: {retry_error})"
+                        )
+                    })?
+            }
+        };
         {
             let mut sessions = self.runtime_shell_cwds.lock().await;
             sessions.insert(key, result.cwd.clone());
@@ -822,5 +876,28 @@ impl<Q: Queue> OtterService<Q> {
             return Ok(true);
         }
         Ok(false)
+    }
+
+    pub async fn pause_job(&self, job_id: Uuid) -> Result<bool> {
+        let updated = self.db.pause_queued_job(job_id).await?;
+        if updated {
+            self.db
+                .insert_job_event(job_id, "paused", serde_json::json!({}))
+                .await?;
+        }
+        Ok(updated)
+    }
+
+    pub async fn resume_job(&self, job_id: Uuid) -> Result<bool> {
+        let updated = self.db.resume_queued_job(job_id).await?;
+        if updated {
+            self.db
+                .insert_job_event(job_id, "resumed", serde_json::json!({}))
+                .await?;
+            self.queue
+                .enqueue(DEFAULT_QUEUE_NAME, &QueueMessage { job_id })
+                .await?;
+        }
+        Ok(updated)
     }
 }

@@ -11,7 +11,7 @@ use bollard::query_parameters::{
     ListContainersOptionsBuilder, LogsOptionsBuilder, RemoveContainerOptionsBuilder,
     RestartContainerOptionsBuilder, StartContainerOptions, StopContainerOptionsBuilder,
 };
-use bollard::{Docker, API_DEFAULT_VERSION};
+use bollard::{ClientVersion, Docker};
 use bytes::Bytes;
 use futures_util::stream::{StreamExt, TryStreamExt};
 use tar::Builder;
@@ -386,11 +386,17 @@ impl DockerRuntimeManager {
 }
 
 fn connect_docker(socket: &str) -> Result<Docker> {
+    // Some Docker daemons reject very old client API versions (e.g. 1.41).
+    // Pin to a modern baseline compatible with current daemon minimums.
+    let client_version = &ClientVersion {
+        major_version: 1,
+        minor_version: 44,
+    };
     if let Some(path) = socket.strip_prefix("unix://") {
-        Docker::connect_with_unix(path, 120, API_DEFAULT_VERSION)
+        Docker::connect_with_unix(path, 120, client_version)
             .with_context(|| format!("failed to connect docker on unix socket {socket}"))
     } else {
-        Docker::connect_with_local_defaults()
+        Docker::connect_with_unix("/var/run/docker.sock", 120, client_version)
             .context("failed to connect docker with local defaults")
     }
 }
