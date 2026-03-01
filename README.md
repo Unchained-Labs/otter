@@ -54,8 +54,10 @@ curl http://localhost:8080/healthz
 - `OTTER_DATABASE_URL` (required), example: `postgres://otter:otter@postgres:5432/otter`
 - `OTTER_REDIS_URL` (required), example: `redis://redis:6379`
 - `OTTER_LISTEN_ADDR` (default `0.0.0.0:8080`)
+- `OTTER_CORS_ALLOWED_ORIGINS` (default `http://localhost:5173`, comma-separated)
 - `OTTER_VIBE_BIN` (default `vibe`)
 - `OTTER_VIBE_HOME_BASE` (default `/var/lib/otter/vibe`)
+- `OTTER_DEFAULT_WORKSPACE_PATH` (optional fallback workspace root when enqueue omits `workspace_id`)
 - `OTTER_MAX_ATTEMPTS` (default `5`)
 - `OTTER_WORKER_CONCURRENCY` (default `1`)
 - `OTTER_ALLOWED_ROOTS` (optional `:`-separated allowlist)
@@ -65,7 +67,7 @@ curl http://localhost:8080/healthz
 
 - `POST /v1/projects`, `GET /v1/projects`
 - `POST /v1/workspaces`, `GET /v1/workspaces`
-- `POST /v1/prompts`
+- `POST /v1/prompts` (`workspace_id` optional when `OTTER_DEFAULT_WORKSPACE_PATH` is configured)
 - `GET /v1/jobs/{id}`
 - `GET /v1/jobs/{id}/events`
 - `POST /v1/jobs/{id}/cancel`
@@ -90,6 +92,7 @@ otter/
 - `docs/architecture.md`
 - `docs/api.md`
 - `docs/workspace-trust-model.md`
+- `docs/prompt-to-result-flow.md`
 - `docs/operations-nuc.md`
 - `docs/runbook.md`
 

@@ -13,6 +13,9 @@ Otter executes prompts in arbitrary project workspaces. To prevent trust leakage
 - Vibe execution is always invoked with:
   - `--workdir <workspace_root>`
   - `VIBE_HOME=<isolated_home>`
+- Prompt intake supports two modes:
+  - explicit `workspace_id` from client
+  - implicit default workspace via `OTTER_DEFAULT_WORKSPACE_PATH` when `workspace_id` is omitted
 
 ## Guardrails
 
@@ -24,3 +27,4 @@ Otter executes prompts in arbitrary project workspaces. To prevent trust leakage
 
 - Rotate/clean isolated homes only when corresponding workspace is retired.
 - Back up isolated homes together with PostgreSQL if auditability is required.
+- For single-repo setups, configure `OTTER_DEFAULT_WORKSPACE_PATH` and let clients omit `workspace_id`.
