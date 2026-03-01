@@ -1,5 +1,7 @@
 # Otter
 
+[![CI](https://github.com/Unchained-Labs/otter/actions/workflows/ci.yml/badge.svg)](https://github.com/Unchained-Labs/otter/actions/workflows/ci.yml)
+
 Otter is a Rust orchestration service and reusable library for running Mistral Vibe programmatically at scale.
 
 It accepts prompts through HTTP endpoints, queues and schedules work, executes `vibe --prompt` in isolated trusted workspaces, and stores full execution history in PostgreSQL.
@@ -14,6 +16,7 @@ It accepts prompts through HTTP endpoints, queues and schedules work, executes `
 - Redis-backed queueing and worker retry lifecycle.
 - Isolated per-workspace `VIBE_HOME` trust model.
 - Streaming execution chunks (`output_chunk`) via SSE.
+- Post-run `setup.sh` hook execution with streamed logs.
 - Workspace filesystem APIs (`tree` / `file`) for frontend explorer UX.
 - Request tracing + lifecycle logs for operations visibility.
 - Dockerized runtime with Compose stack for local and NUC deployment.
@@ -144,3 +147,15 @@ pre-commit run --all-files
 - Docker image installs `mistral-vibe` and exposes `vibe` in `PATH`.
 - `scripts/bootstrap_host_vibe_home.sh` mirrors `/home/wardn/.vibe` into `${HOME}/.vibe` and writes `MISTRAL_API_KEY` from `otter/.env`.
 - In production, put the API behind authentication and TLS termination.
+
+## Execution Contract For Vibe
+
+Otter composes a system prompt that enforces safe and repeatable project execution:
+
+- Always work in a dedicated project subfolder under workspace.
+- Install dependencies before run/build.
+- Generate an executable `setup.sh` at project root.
+- Start the generated app/service in background.
+- Print clear run/stop instructions and project location.
+
+After a successful vibe execution, Otter attempts to run `setup.sh` and streams its output back as `output_chunk` events.
