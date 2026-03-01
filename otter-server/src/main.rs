@@ -22,7 +22,8 @@ use otter_core::queue::RedisQueue;
 use otter_core::service::OtterService;
 use tokio::time::Duration as TokioDuration;
 use tower_http::cors::{AllowOrigin, CorsLayer};
-use tracing::info;
+use tower_http::trace::{DefaultOnResponse, TraceLayer};
+use tracing::{info, Level};
 use uuid::Uuid;
 
 #[derive(Clone)]
@@ -132,6 +133,7 @@ async fn main() -> Result<()> {
         )
         .route("/v1/history", get(get_history))
         .with_state(state)
+        .layer(TraceLayer::new_for_http().on_response(DefaultOnResponse::new().level(Level::INFO)))
         .layer(cors);
 
     let listener = tokio::net::TcpListener::bind(&config.listen_addr).await?;
