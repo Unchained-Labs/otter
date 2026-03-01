@@ -13,6 +13,9 @@ It accepts prompts through HTTP endpoints, queues and schedules work, executes `
 - PostgreSQL persistence for projects, workspaces, jobs, outputs, and events.
 - Redis-backed queueing and worker retry lifecycle.
 - Isolated per-workspace `VIBE_HOME` trust model.
+- Streaming execution chunks (`output_chunk`) via SSE.
+- Workspace filesystem APIs (`tree` / `file`) for frontend explorer UX.
+- Request tracing + lifecycle logs for operations visibility.
 - Dockerized runtime with Compose stack for local and NUC deployment.
 
 ## Quick Start (Docker Compose)
@@ -67,9 +70,11 @@ curl http://localhost:8080/healthz
 
 - `POST /v1/projects`, `GET /v1/projects`
 - `POST /v1/workspaces`, `GET /v1/workspaces`
+- `GET /v1/workspaces/{id}/tree`, `GET /v1/workspaces/{id}/file`
 - `POST /v1/prompts` (`workspace_id` optional when `OTTER_DEFAULT_WORKSPACE_PATH` is configured)
 - `GET /v1/jobs/{id}`
 - `GET /v1/jobs/{id}/events`
+- `GET /v1/events/stream` (includes `output_chunk` events)
 - `POST /v1/jobs/{id}/cancel`
 - `GET /v1/queue`
 - `PATCH /v1/queue/{id}` (update queue position via priority)

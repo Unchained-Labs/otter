@@ -31,6 +31,11 @@ Base URL: `http://<host>:8080`
   - Creates workspace and initializes isolated Vibe trust context.
 - `GET /v1/workspaces`
   - Lists all workspaces.
+  - When `OTTER_DEFAULT_WORKSPACE_PATH` is set, top-level directories under that root are synchronized into workspace records.
+- `GET /v1/workspaces/{id}/tree?path=&depth=2`
+  - Lists directory/file entries under a workspace root (safe canonicalized relative traversal only).
+- `GET /v1/workspaces/{id}/file?path=<relative_path>`
+  - Returns file content for a workspace-relative file path.
 
 ## Prompt Queueing
 
@@ -56,6 +61,7 @@ Base URL: `http://<host>:8080`
   - Returns ordered lifecycle events.
 - `GET /v1/events/stream`
   - Server-Sent Events stream of job lifecycle events for live UI updates.
+  - Includes incremental `output_chunk` events (`stdout` / `stderr`) during Vibe execution.
 
 ## History
 
@@ -72,3 +78,8 @@ Base URL: `http://<host>:8080`
     { "priority": 10 }
     ```
   - Repositions queued jobs by updating priority.
+
+## Operational Visibility
+
+- HTTP request tracing is enabled server-side (status + latency).
+- Job lifecycle logs are emitted by worker/service layers for enqueue/claim/retry/fail/complete states.
