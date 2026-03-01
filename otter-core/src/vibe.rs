@@ -192,6 +192,8 @@ fn compose_vibe_prompt(user_prompt: &str) -> String {
 - Work in a project-specific subfolder under the current workspace. Never develop directly in workspace root.
 - If needed, create a clear project folder first (for example `projects/<project-name>`), then work only inside it.
 - Ensure dependencies are installed before running/building (detect toolchain and install accordingly: npm/pnpm/yarn, pip/uv/poetry, cargo, etc.).
+- Always create a setup script named `setup.sh` at the project root that installs and configures everything needed to run the project.
+- Ensure `setup.sh` is executable (`chmod +x setup.sh`) and deterministic/idempotent (safe to run multiple times).
 - When implementation is complete, start the app/service in background and verify it runs.
 - At the end, print clear run instructions: start command, stop command, and where the project lives.
 - Always run the app/service in the background. Give the link to the project in the output.
