@@ -12,6 +12,8 @@ pub struct AppConfig {
     pub vibe_bin: String,
     pub vibe_base_home: PathBuf,
     pub default_workspace_path: Option<PathBuf>,
+    pub default_workspace_subdir: String,
+    pub lavoix_url: String,
     pub max_attempts: i32,
     pub worker_concurrency: usize,
 }
@@ -48,6 +50,10 @@ impl AppConfig {
             default_workspace_path: env::var("OTTER_DEFAULT_WORKSPACE_PATH")
                 .ok()
                 .map(PathBuf::from),
+            default_workspace_subdir: env::var("OTTER_DEFAULT_WORKSPACE_SUBDIR")
+                .unwrap_or_else(|_| "auto".to_string()),
+            lavoix_url: env::var("OTTER_LAVOIX_URL")
+                .unwrap_or_else(|_| "http://lavoix:8090".to_string()),
             max_attempts: env::var("OTTER_MAX_ATTEMPTS")
                 .ok()
                 .and_then(|value| value.parse().ok())
