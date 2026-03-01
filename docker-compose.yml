@@ -79,7 +79,7 @@ services:
         condition: service_healthy
     env_file:
       - .env
-    command: ["/usr/local/bin/otter-worker"]
+    entrypoint: ["/usr/local/bin/otter-worker"]
     environment:
       OTTER_DATABASE_URL: postgres://otter:otter@postgres:5432/otter
       OTTER_REDIS_URL: redis://redis:6379

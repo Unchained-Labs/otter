@@ -5,6 +5,7 @@ use std::time::Duration;
 use anyhow::{anyhow, Result};
 use chrono::Utc;
 use tokio::time::sleep;
+use tracing::{info, warn};
 use uuid::Uuid;
 use validator::Validate;
 
@@ -111,6 +112,12 @@ impl<Q: Queue> OtterService<Q> {
         self.db
             .insert_job_event(job.id, "queued", serde_json::json!({}))
             .await?;
+        info!(
+            %workspace_id,
+            job_id = %job.id,
+            priority = job.priority,
+            "job accepted and queued"
+        );
         Ok(job)
     }
 
@@ -173,6 +180,7 @@ impl<Q: Queue> OtterService<Q> {
             sleep(Duration::from_millis(250)).await;
             return Ok(None);
         };
+        info!(job_id = %message.job_id, "dequeued job from redis queue");
         let Some(job) = self.db.claim_queued_job_by_id(message.job_id).await? else {
             if let Some(job_state) = self.db.fetch_job(message.job_id).await? {
                 let should_requeue_for_schedule = matches!(job_state.status, JobStatus::Queued)
@@ -189,11 +197,22 @@ impl<Q: Queue> OtterService<Q> {
                             },
                         )
                         .await?;
+                    info!(
+                        job_id = %message.job_id,
+                        schedule_at = ?job_state.schedule_at,
+                        "job is scheduled in the future; re-queued"
+                    );
                 }
             }
             sleep(Duration::from_millis(250)).await;
             return Ok(None);
         };
+        info!(
+            job_id = %job.id,
+            attempts = job.attempts,
+            max_attempts = job.max_attempts,
+            "job claimed and starting execution"
+        );
 
         self.db
             .insert_job_event(job.id, "started", serde_json::json!({}))
@@ -217,6 +236,13 @@ impl<Q: Queue> OtterService<Q> {
                             serde_json::json!({ "error": error_message }),
                         )
                         .await?;
+                    warn!(
+                        job_id = %job.id,
+                        attempts = job.attempts + 1,
+                        max_attempts = job.max_attempts,
+                        error = %error_message,
+                        "job failed and was re-queued for retry"
+                    );
                 }
             } else {
                 let failed = self.db.fail_job(job.id, error_message.clone()).await?;
@@ -228,6 +254,13 @@ impl<Q: Queue> OtterService<Q> {
                             serde_json::json!({ "error": error_message }),
                         )
                         .await?;
+                    warn!(
+                        job_id = %job.id,
+                        attempts = job.attempts + 1,
+                        max_attempts = job.max_attempts,
+                        error = %error_message,
+                        "job failed permanently"
+                    );
                 }
             }
         }
@@ -259,6 +292,10 @@ impl<Q: Queue> OtterService<Q> {
             .await?;
         if !completed {
             // Job was cancelled or transitioned concurrently; do not emit completion event.
+            warn!(
+                job_id = %job.id,
+                "job completion skipped because status changed concurrently"
+            );
             return Ok(());
         }
 
@@ -272,6 +309,11 @@ impl<Q: Queue> OtterService<Q> {
                 }),
             )
             .await?;
+        info!(
+            job_id = %job.id,
+            exit_code = result.exit_code,
+            "job completed successfully"
+        );
         Ok(())
     }
 
