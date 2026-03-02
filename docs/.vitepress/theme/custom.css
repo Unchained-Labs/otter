@@ -1,0 +1,36 @@
+:root {
+  --vp-c-brand-1: #3e5c76;
+  --vp-c-brand-2: #1d2d44;
+  --vp-c-brand-3: #748cab;
+  --vp-c-bg: #f0ebd8;
+  --vp-c-bg-soft: #ffffff;
+  --vp-c-text-1: #0d1321;
+}
+
+.dark {
+  --vp-c-brand-1: #748cab;
+  --vp-c-brand-2: #3e5c76;
+  --vp-c-brand-3: #f0ebd8;
+  --vp-c-bg: #0d1321;
+  --vp-c-bg-soft: #1d2d44;
+  --vp-c-text-1: #f0ebd8;
+}
+
+.VPDoc {
+  max-width: 1280px;
+}
+
+.VPNavBarTitle .title {
+  font-weight: 700;
+  letter-spacing: 0.02em;
+}
+
+.vp-doc h1,
+.vp-doc h2,
+.vp-doc h3 {
+  letter-spacing: 0.01em;
+}
+
+.vp-doc a {
+  text-underline-offset: 2px;
+}
