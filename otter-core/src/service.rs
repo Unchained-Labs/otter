@@ -477,43 +477,101 @@ impl<Q: Queue> OtterService<Q> {
             "vibe execution finished"
         );
 
-        let setup_line_count = self
+        match self
             .run_setup_script_with_streaming(job.id, &workspace_path)
-            .await?;
-        info!(
-            job_id = %job.id,
-            setup_lines = setup_line_count,
-            "setup.sh execution finished"
-        );
-
-        if let Some(runtime) = &self.runtime_manager {
-            let runtime_info = runtime
-                .ensure_workspace_container(workspace.id, &workspace_path)
-                .await?;
-            self.db
-                .insert_job_event(
-                    job.id,
-                    "runtime_container_ready",
-                    serde_json::json!({
-                        "container_name": runtime_info.container_name,
-                        "container_id": runtime_info.container_id,
-                        "status": runtime_info.status,
-                        "preferred_url": runtime_info.preferred_url,
-                        "ports": runtime_info.ports,
-                    }),
-                )
-                .await?;
-            if let Some(preview_url) = runtime_info.preferred_url {
+            .await
+        {
+            Ok(setup_line_count) => {
+                info!(
+                    job_id = %job.id,
+                    setup_lines = setup_line_count,
+                    "setup.sh execution finished"
+                );
+            }
+            Err(error) => {
+                let message = error.to_string();
+                warn!(
+                    job_id = %job.id,
+                    error = %message,
+                    "setup hook failed after vibe completion; marking as warning"
+                );
+                self.db
+                    .insert_job_event(
+                        job.id,
+                        "setup_failed",
+                        serde_json::json!({ "error": message }),
+                    )
+                    .await?;
                 self.db
                     .insert_job_event(
                         job.id,
                         "output_chunk",
                         serde_json::json!({
-                            "stream": "stdout",
-                            "line": format!("[runtime] preview available at {preview_url}")
+                            "stream": "stderr",
+                            "line": format!("[setup] warning: {}", error)
                         }),
                     )
                     .await?;
+            }
+        }
+
+        if let Some(runtime) = &self.runtime_manager {
+            match runtime
+                .ensure_workspace_container(workspace.id, &workspace_path)
+                .await
+            {
+                Ok(runtime_info) => {
+                    self.db
+                        .insert_job_event(
+                            job.id,
+                            "runtime_container_ready",
+                            serde_json::json!({
+                                "container_name": runtime_info.container_name,
+                                "container_id": runtime_info.container_id,
+                                "status": runtime_info.status,
+                                "preferred_url": runtime_info.preferred_url,
+                                "ports": runtime_info.ports,
+                            }),
+                        )
+                        .await?;
+                    if let Some(preview_url) = runtime_info.preferred_url {
+                        self.db
+                            .insert_job_event(
+                                job.id,
+                                "output_chunk",
+                                serde_json::json!({
+                                    "stream": "stdout",
+                                    "line": format!("[runtime] preview available at {preview_url}")
+                                }),
+                            )
+                            .await?;
+                    }
+                }
+                Err(error) => {
+                    let message = error.to_string();
+                    warn!(
+                        job_id = %job.id,
+                        error = %message,
+                        "runtime provisioning failed after vibe completion; marking as warning"
+                    );
+                    self.db
+                        .insert_job_event(
+                            job.id,
+                            "runtime_setup_failed",
+                            serde_json::json!({ "error": message }),
+                        )
+                        .await?;
+                    self.db
+                        .insert_job_event(
+                            job.id,
+                            "output_chunk",
+                            serde_json::json!({
+                                "stream": "stderr",
+                                "line": format!("[runtime] warning: {}", error)
+                            }),
+                        )
+                        .await?;
+                }
             }
         }
 
@@ -559,10 +617,17 @@ impl<Q: Queue> OtterService<Q> {
     ) -> Result<usize> {
         let setup_path = workspace_path.join("setup.sh");
         if !setup_path.exists() {
-            return Err(anyhow!(
-                "setup.sh was not generated in project root ({})",
-                setup_path.display()
-            ));
+            self.db
+                .insert_job_event(
+                    job_id,
+                    "output_chunk",
+                    serde_json::json!({
+                        "stream": "stdout",
+                        "line": "[setup] skipped: setup.sh not found"
+                    }),
+                )
+                .await?;
+            return Ok(0);
         }
 
         self.db
