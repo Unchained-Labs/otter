@@ -596,6 +596,21 @@ impl Database {
         Ok(())
     }
 
+    pub async fn list_job_dependency_ids(&self, job_id: Uuid) -> Result<Vec<Uuid>> {
+        let rows = sqlx::query_scalar::<_, Uuid>(
+            r#"
+            SELECT depends_on_job_id
+            FROM job_dependencies
+            WHERE job_id = $1
+            ORDER BY created_at ASC
+            "#,
+        )
+        .bind(job_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
     pub async fn set_job_project_path(&self, job_id: Uuid, project_path: &str) -> Result<bool> {
         let result = sqlx::query(
             r#"

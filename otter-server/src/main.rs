@@ -146,6 +146,7 @@ struct JobResponse {
     job: Job,
     output: Option<JobOutput>,
     queue_rank: Option<i64>,
+    dependency_job_ids: Vec<Uuid>,
 }
 
 #[derive(serde::Deserialize)]
@@ -791,6 +792,7 @@ async fn enqueue_voice_prompt(
     let mut workspace_id: Option<Uuid> = None;
     let mut language: Option<String> = None;
     let mut provider: Option<String> = None;
+    let mut dependency_job_ids: Vec<Uuid> = Vec::new();
     let mut file_name = "audio.webm".to_string();
     let mut content_type = "audio/webm".to_string();
     let mut audio_bytes: Option<Vec<u8>> = None;
@@ -829,6 +831,17 @@ async fn enqueue_voice_prompt(
                 let value = field.text().await.map_err(internal_error)?;
                 if !value.trim().is_empty() {
                     provider = Some(value);
+                }
+            }
+            "dependency_job_id" => {
+                let value = field.text().await.map_err(internal_error)?;
+                if !value.trim().is_empty() {
+                    dependency_job_ids.push(Uuid::parse_str(value.trim()).map_err(|e| {
+                        (
+                            StatusCode::BAD_REQUEST,
+                            format!("invalid dependency_job_id: {e}"),
+                        )
+                    })?);
                 }
             }
             _ => {}
@@ -871,7 +884,11 @@ async fn enqueue_voice_prompt(
             priority: None,
             schedule_at: None,
             project_path: None,
-            dependency_job_ids: None,
+            dependency_job_ids: if dependency_job_ids.is_empty() {
+                None
+            } else {
+                Some(dependency_job_ids)
+            },
         })
         .await
         .map_err(internal_error)?;
@@ -956,10 +973,17 @@ async fn get_job(
         .queue_rank_for_job(id)
         .await
         .map_err(internal_error)?;
+    let dependency_job_ids = state
+        .service
+        .db
+        .list_job_dependency_ids(id)
+        .await
+        .map_err(internal_error)?;
     Ok(Json(JobResponse {
         job,
         output,
         queue_rank,
+        dependency_job_ids,
     }))
 }
 
