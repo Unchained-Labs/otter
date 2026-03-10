@@ -10,6 +10,8 @@ fn rejects_empty_prompt() {
         prompt: String::new(),
         priority: None,
         schedule_at: None,
+        project_path: None,
+        dependency_job_ids: None,
     };
     assert!(payload.validate().is_err());
 }

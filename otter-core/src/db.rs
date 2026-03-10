@@ -137,19 +137,21 @@ impl Database {
         prompt: &str,
         priority: Option<i32>,
         schedule_at: Option<chrono::DateTime<chrono::Utc>>,
+        project_path: Option<&str>,
         max_attempts: i32,
     ) -> Result<Job> {
         let job = sqlx::query_as::<_, Job>(
             r#"
-            INSERT INTO jobs (workspace_id, prompt, status, priority, schedule_at, attempts, max_attempts)
-            VALUES ($1, $2, 'queued', $3, $4, 0, $5)
-            RETURNING id, workspace_id, prompt, preview_url, is_paused, status, priority, schedule_at, attempts, max_attempts, error, created_at, updated_at
+            INSERT INTO jobs (workspace_id, prompt, status, priority, schedule_at, project_path, attempts, max_attempts)
+            VALUES ($1, $2, 'queued', $3, $4, $5, 0, $6)
+            RETURNING id, workspace_id, prompt, preview_url, project_path, runtime_start_command, runtime_stop_command, runtime_command_cwd, is_paused, status, priority, schedule_at, attempts, max_attempts, error, created_at, updated_at
             "#,
         )
         .bind(workspace_id)
         .bind(prompt)
         .bind(priority.unwrap_or(100))
         .bind(schedule_at)
+        .bind(project_path)
         .bind(max_attempts)
         .fetch_one(&self.pool)
         .await?;
@@ -159,7 +161,7 @@ impl Database {
     pub async fn fetch_job(&self, job_id: Uuid) -> Result<Option<Job>> {
         let job = sqlx::query_as::<_, Job>(
             r#"
-            SELECT id, workspace_id, prompt, preview_url, is_paused, status, priority, schedule_at, attempts, max_attempts, error, created_at, updated_at
+            SELECT id, workspace_id, prompt, preview_url, project_path, runtime_start_command, runtime_stop_command, runtime_command_cwd, is_paused, status, priority, schedule_at, attempts, max_attempts, error, created_at, updated_at
             FROM jobs WHERE id = $1
             "#,
         )
@@ -296,7 +298,14 @@ impl Database {
               AND j.status = 'queued'
               AND j.is_paused = false
               AND (j.schedule_at IS NULL OR j.schedule_at <= now())
-            RETURNING j.id, j.workspace_id, j.prompt, j.preview_url, j.is_paused, j.status, j.priority, j.schedule_at, j.attempts, j.max_attempts, j.error, j.created_at, j.updated_at
+              AND NOT EXISTS (
+                SELECT 1
+                FROM job_dependencies dep
+                JOIN jobs parent ON parent.id = dep.depends_on_job_id
+                WHERE dep.job_id = j.id
+                  AND parent.status <> 'succeeded'
+              )
+            RETURNING j.id, j.workspace_id, j.prompt, j.preview_url, j.project_path, j.runtime_start_command, j.runtime_stop_command, j.runtime_command_cwd, j.is_paused, j.status, j.priority, j.schedule_at, j.attempts, j.max_attempts, j.error, j.created_at, j.updated_at
             "#,
         )
         .bind(job_id)
@@ -412,6 +421,24 @@ impl Database {
         Ok(rank)
     }
 
+    pub async fn has_unresolved_dependencies(&self, job_id: Uuid) -> Result<bool> {
+        let blocked = sqlx::query_scalar::<_, bool>(
+            r#"
+            SELECT EXISTS (
+                SELECT 1
+                FROM job_dependencies dep
+                JOIN jobs parent ON parent.id = dep.depends_on_job_id
+                WHERE dep.job_id = $1
+                  AND parent.status <> 'succeeded'
+            )
+            "#,
+        )
+        .bind(job_id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(blocked)
+    }
+
     pub async fn list_queue(&self, limit: i64, offset: i64) -> Result<Vec<QueueItem>> {
         let rows = sqlx::query_as::<_, QueueItem>(
             r#"
@@ -420,6 +447,9 @@ impl Database {
                 workspace_id,
                 prompt,
                 is_paused,
+                blocked_by_dependencies,
+                dependency_count,
+                unresolved_dependency_count,
                 priority,
                 schedule_at,
                 queue_rank,
@@ -430,6 +460,25 @@ impl Database {
                     workspace_id,
                     prompt,
                     is_paused,
+                    EXISTS (
+                        SELECT 1
+                        FROM job_dependencies dep
+                        JOIN jobs parent ON parent.id = dep.depends_on_job_id
+                        WHERE dep.job_id = jobs.id
+                          AND parent.status <> 'succeeded'
+                    ) AS blocked_by_dependencies,
+                    (
+                        SELECT COUNT(*)
+                        FROM job_dependencies dep
+                        WHERE dep.job_id = jobs.id
+                    )::bigint AS dependency_count,
+                    (
+                        SELECT COUNT(*)
+                        FROM job_dependencies dep
+                        JOIN jobs parent ON parent.id = dep.depends_on_job_id
+                        WHERE dep.job_id = jobs.id
+                          AND parent.status <> 'succeeded'
+                    )::bigint AS unresolved_dependency_count,
                     priority,
                     schedule_at,
                     created_at,
@@ -492,6 +541,97 @@ impl Database {
             "#,
         )
         .bind(job_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    pub async fn hold_job(&self, job_id: Uuid) -> Result<bool> {
+        let result = sqlx::query(
+            r#"
+            UPDATE jobs
+            SET status = CASE WHEN status = 'running' THEN 'queued' ELSE status END,
+                is_paused = true,
+                updated_at = now()
+            WHERE id = $1
+              AND status IN ('queued', 'running')
+            "#,
+        )
+        .bind(job_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    pub async fn add_job_dependencies(&self, job_id: Uuid, dependency_ids: &[Uuid]) -> Result<()> {
+        if dependency_ids.is_empty() {
+            return Ok(());
+        }
+        let mut tx = self.pool.begin().await?;
+        for dependency_id in dependency_ids {
+            if dependency_id == &job_id {
+                bail!("job cannot depend on itself");
+            }
+            let exists =
+                sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM jobs WHERE id = $1)")
+                    .bind(dependency_id)
+                    .fetch_one(&mut *tx)
+                    .await?;
+            if !exists {
+                bail!("dependency job not found: {dependency_id}");
+            }
+            sqlx::query(
+                r#"
+                INSERT INTO job_dependencies (job_id, depends_on_job_id)
+                VALUES ($1, $2)
+                ON CONFLICT DO NOTHING
+                "#,
+            )
+            .bind(job_id)
+            .bind(dependency_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn set_job_project_path(&self, job_id: Uuid, project_path: &str) -> Result<bool> {
+        let result = sqlx::query(
+            r#"
+            UPDATE jobs
+            SET project_path = $2, updated_at = now()
+            WHERE id = $1
+            "#,
+        )
+        .bind(job_id)
+        .bind(project_path)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    pub async fn set_job_runtime_launch_config(
+        &self,
+        job_id: Uuid,
+        start_command: &str,
+        stop_command: Option<&str>,
+        working_directory: Option<&str>,
+    ) -> Result<bool> {
+        let result = sqlx::query(
+            r#"
+            UPDATE jobs
+            SET runtime_start_command = $2,
+                runtime_stop_command = $3,
+                runtime_command_cwd = $4,
+                updated_at = now()
+            WHERE id = $1
+            "#,
+        )
+        .bind(job_id)
+        .bind(start_command)
+        .bind(stop_command)
+        .bind(working_directory)
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected() > 0)

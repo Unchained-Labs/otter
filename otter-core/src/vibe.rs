@@ -76,8 +76,10 @@ impl VibeExecutor {
         job_id: uuid::Uuid,
         workspace_path: &Path,
         isolated_vibe_home: &Path,
+        project_path: Option<&str>,
     ) -> Result<VibeExecutionResult> {
-        let effective_prompt = compose_vibe_prompt(prompt, job_id, &self.otter_api_base_url);
+        let effective_prompt =
+            compose_vibe_prompt(prompt, job_id, &self.otter_api_base_url, project_path);
         let mut cmd = Command::new(&self.vibe_bin);
         cmd.arg("--prompt")
             .arg(&effective_prompt)
@@ -119,6 +121,7 @@ impl VibeExecutor {
         job_id: uuid::Uuid,
         workspace_path: &Path,
         isolated_vibe_home: &Path,
+        project_path: Option<&str>,
         mut on_chunk: F,
         mut should_cancel: C,
     ) -> Result<VibeExecutionResult>
@@ -128,7 +131,8 @@ impl VibeExecutor {
         C: FnMut() -> CFut,
         CFut: Future<Output = Result<bool>>,
     {
-        let effective_prompt = compose_vibe_prompt(prompt, job_id, &self.otter_api_base_url);
+        let effective_prompt =
+            compose_vibe_prompt(prompt, job_id, &self.otter_api_base_url, project_path);
         let mut cmd = Command::new(&self.vibe_bin);
         cmd.arg("--prompt")
             .arg(&effective_prompt)
@@ -243,22 +247,41 @@ impl VibeExecutor {
     }
 }
 
-fn compose_vibe_prompt(user_prompt: &str, job_id: uuid::Uuid, otter_api_base_url: &str) -> String {
+fn compose_vibe_prompt(
+    user_prompt: &str,
+    job_id: uuid::Uuid,
+    otter_api_base_url: &str,
+    project_path: Option<&str>,
+) -> String {
+    let project_path_instruction = match project_path.map(str::trim).filter(|value| !value.is_empty())
+    {
+        Some(path) => format!(
+            "- Use this project path inside the workspace root: `{path}`. Do not write outside this path.\n"
+        ),
+        None => String::new(),
+    };
     format!(
         r#"SYSTEM REQUIREMENTS (ALWAYS APPLY):
-- Work in a project-specific subfolder under the current workspace. Never develop directly in workspace root.
-- If needed, create a clear project folder first (for example `projects/<project-name>`), then work only inside it.
-- Ensure dependencies are installed before running/building (detect toolchain and install accordingly: npm/pnpm/yarn, pip/uv/poetry, cargo, etc.).
+- Work in a project-specific subfolder under the current workspace. Never develop directly in workspace root, even documentation.
+- Consequently, the first thing you need to do is create a project-specific subfolder under the current workspace.
+- If a project path is provided, use it.
+{project_path_instruction}
+- ONLY build & run using DOCKER. NEVER run directly on host process as the main path.
 - Always create a production-ready Dockerfile at the project root and use it as the primary run path.
 - Build and run the generated app/service inside Docker (do not run directly on host process as the main path).
 - Verify the container is running and expose the app on a reachable port from the current environment.
 - When implementation is complete, start the app/service in background and verify it runs.
+- Only send a real reachable HTTP/HTTPS URL as preview_url.
+- Multiple Agents are running in parallel and will run specific dockers on specific ports. Make sure to use the correct port when setting the preview URL.
+- At the end, print clear run instructions: docker build command, docker run command, docker stop/remove command, and where the project lives.
+- Always include where to access the running app (URL/host port) in the final output.
 - Use this exact Job ID when setting demo URL: `{job_id}`.
 - ONLY AT THE END, AFTER EVERYTHING ELSE: after you determine the runnable app URL, call this API to set preview URL for this job:
   `curl -sS -X POST "{otter_api_base_url}/v1/jobs/{job_id}/preview-url" -H "Content-Type: application/json" -d '{{"preview_url":"http://<host>:<port>"}}'`
-- Only send a real reachable HTTP/HTTPS URL as preview_url.
-- At the end, print clear run instructions: docker build command, docker run command, docker stop/remove command, and where the project lives.
-- Always include where to access the running app (URL/host port) in the final output.
+- Also set runtime launch commands for the UI:
+  `curl -sS -X POST "{otter_api_base_url}/v1/jobs/{job_id}/runtime-launch" -H "Content-Type: application/json" -d '{{"start_command":"docker compose up -d","stop_command":"docker compose down","working_directory":"<relative/path/from_workspace>"}}'`
+- You also MUST run the docker run command & check that you can ping the app on the port. Do not stop until the app is running.
+- All apps you build must look modern and professional; the code should be clean and well-organized.
 
 USER TASK:
 {user_prompt}"#
