@@ -925,6 +925,7 @@ async fn transcribe_with_lavoix(
     let url = format!("{}/v1/stt/transcribe", lavoix_url.trim_end_matches('/'));
     let response = reqwest::Client::new()
         .post(url)
+        .timeout(std::time::Duration::from_secs(45))
         .multipart(form)
         .send()
         .await
