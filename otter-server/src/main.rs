@@ -146,6 +146,7 @@ struct JobResponse {
     job: Job,
     output: Option<JobOutput>,
     queue_rank: Option<i64>,
+    dependency_job_ids: Vec<Uuid>,
 }
 
 #[derive(serde::Deserialize)]
@@ -162,6 +163,18 @@ struct VoiceEnqueueResponse {
 #[derive(serde::Deserialize)]
 struct SetJobPreviewUrlRequest {
     preview_url: String,
+}
+
+#[derive(serde::Deserialize)]
+struct SetJobProjectPathRequest {
+    project_path: String,
+}
+
+#[derive(serde::Deserialize)]
+struct SetJobRuntimeLaunchRequest {
+    start_command: String,
+    stop_command: Option<String>,
+    working_directory: Option<String>,
 }
 
 #[tokio::main]
@@ -243,7 +256,18 @@ async fn main() -> Result<()> {
         .route("/v1/jobs/{id}", get(get_job))
         .route("/v1/jobs/{id}/events", get(get_job_events))
         .route("/v1/jobs/{id}/preview-url", post(set_job_preview_url))
+        .route("/v1/jobs/{id}/project-path", post(set_job_project_path))
+        .route("/v1/jobs/{id}/runtime-launch", post(set_job_runtime_launch))
+        .route(
+            "/v1/jobs/{id}/runtime-launch/start",
+            post(start_job_runtime_launch),
+        )
+        .route(
+            "/v1/jobs/{id}/runtime-launch/stop",
+            post(stop_job_runtime_launch),
+        )
         .route("/v1/jobs/{id}/pause", post(pause_job))
+        .route("/v1/jobs/{id}/hold", post(hold_job))
         .route("/v1/jobs/{id}/resume", post(resume_job))
         .route("/v1/events/stream", get(stream_job_events))
         .route("/v1/jobs/{id}/cancel", post(cancel_job))
@@ -768,6 +792,7 @@ async fn enqueue_voice_prompt(
     let mut workspace_id: Option<Uuid> = None;
     let mut language: Option<String> = None;
     let mut provider: Option<String> = None;
+    let mut dependency_job_ids: Vec<Uuid> = Vec::new();
     let mut file_name = "audio.webm".to_string();
     let mut content_type = "audio/webm".to_string();
     let mut audio_bytes: Option<Vec<u8>> = None;
@@ -806,6 +831,17 @@ async fn enqueue_voice_prompt(
                 let value = field.text().await.map_err(internal_error)?;
                 if !value.trim().is_empty() {
                     provider = Some(value);
+                }
+            }
+            "dependency_job_id" => {
+                let value = field.text().await.map_err(internal_error)?;
+                if !value.trim().is_empty() {
+                    dependency_job_ids.push(Uuid::parse_str(value.trim()).map_err(|e| {
+                        (
+                            StatusCode::BAD_REQUEST,
+                            format!("invalid dependency_job_id: {e}"),
+                        )
+                    })?);
                 }
             }
             _ => {}
@@ -847,6 +883,12 @@ async fn enqueue_voice_prompt(
             prompt: prompt.clone(),
             priority: None,
             schedule_at: None,
+            project_path: None,
+            dependency_job_ids: if dependency_job_ids.is_empty() {
+                None
+            } else {
+                Some(dependency_job_ids)
+            },
         })
         .await
         .map_err(internal_error)?;
@@ -883,6 +925,7 @@ async fn transcribe_with_lavoix(
     let url = format!("{}/v1/stt/transcribe", lavoix_url.trim_end_matches('/'));
     let response = reqwest::Client::new()
         .post(url)
+        .timeout(std::time::Duration::from_secs(45))
         .multipart(form)
         .send()
         .await
@@ -931,10 +974,17 @@ async fn get_job(
         .queue_rank_for_job(id)
         .await
         .map_err(internal_error)?;
+    let dependency_job_ids = state
+        .service
+        .db
+        .list_job_dependency_ids(id)
+        .await
+        .map_err(internal_error)?;
     Ok(Json(JobResponse {
         job,
         output,
         queue_rank,
+        dependency_job_ids,
     }))
 }
 
@@ -972,6 +1022,17 @@ async fn pause_job(
     Ok(StatusCode::NO_CONTENT)
 }
 
+async fn hold_job(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let updated = state.service.hold_job(id).await.map_err(internal_error)?;
+    if !updated {
+        return Err((StatusCode::NOT_FOUND, "queued/running job not found".into()));
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
 async fn resume_job(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -981,6 +1042,101 @@ async fn resume_job(
         return Err((StatusCode::NOT_FOUND, "paused queued job not found".into()));
     }
     Ok(StatusCode::NO_CONTENT)
+}
+
+async fn set_job_project_path(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(body): Json<SetJobProjectPathRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let project_path = normalize_relative_workspace_path(body.project_path.as_str())?;
+    let updated = state
+        .service
+        .db
+        .set_job_project_path(id, &project_path)
+        .await
+        .map_err(internal_error)?;
+    if !updated {
+        return Err((StatusCode::NOT_FOUND, "job not found".to_string()));
+    }
+    state
+        .service
+        .db
+        .insert_job_event(
+            id,
+            "project_path_set",
+            serde_json::json!({ "project_path": project_path }),
+        )
+        .await
+        .map_err(internal_error)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn set_job_runtime_launch(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(body): Json<SetJobRuntimeLaunchRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let start_command = body.start_command.trim();
+    if start_command.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "start_command must not be empty".to_string(),
+        ));
+    }
+    let stop_command = body
+        .stop_command
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let working_directory = body
+        .working_directory
+        .as_deref()
+        .map(normalize_relative_workspace_path)
+        .transpose()?;
+    let updated = state
+        .service
+        .db
+        .set_job_runtime_launch_config(
+            id,
+            start_command,
+            stop_command,
+            working_directory.as_deref(),
+        )
+        .await
+        .map_err(internal_error)?;
+    if !updated {
+        return Err((StatusCode::NOT_FOUND, "job not found".to_string()));
+    }
+    state
+        .service
+        .db
+        .insert_job_event(
+            id,
+            "runtime_launch_config_set",
+            serde_json::json!({
+                "start_command": start_command,
+                "stop_command": stop_command,
+                "working_directory": working_directory
+            }),
+        )
+        .await
+        .map_err(internal_error)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn start_job_runtime_launch(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    execute_job_runtime_launch(state, id, true).await.map(Json)
+}
+
+async fn stop_job_runtime_launch(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    execute_job_runtime_launch(state, id, false).await.map(Json)
 }
 
 async fn set_job_preview_url(
@@ -1099,8 +1255,91 @@ async fn update_queue_position(
     Ok(StatusCode::NO_CONTENT)
 }
 
+async fn execute_job_runtime_launch(
+    state: AppState,
+    job_id: Uuid,
+    start: bool,
+) -> Result<WorkspaceCommandResponse, (StatusCode, String)> {
+    let job = state
+        .service
+        .db
+        .fetch_job(job_id)
+        .await
+        .map_err(internal_error)?
+        .ok_or((StatusCode::NOT_FOUND, "job not found".to_string()))?;
+    let command = if start {
+        job.runtime_start_command.clone()
+    } else {
+        job.runtime_stop_command.clone()
+    }
+    .ok_or((
+        StatusCode::BAD_REQUEST,
+        if start {
+            "runtime start command is not configured"
+        } else {
+            "runtime stop command is not configured"
+        }
+        .to_string(),
+    ))?;
+    let result = execute_workspace_command(
+        state.clone(),
+        Some(job.workspace_id),
+        WorkspaceCommandRequest {
+            command,
+            working_directory: job.runtime_command_cwd.clone(),
+            shell_session_id: Some(format!("job-runtime:{job_id}")),
+            timeout_seconds: Some(120),
+        },
+    )
+    .await?;
+    let event_type = if start {
+        "runtime_launch_started"
+    } else {
+        "runtime_launch_stopped"
+    };
+    state
+        .service
+        .db
+        .insert_job_event(
+            job_id,
+            event_type,
+            serde_json::json!({
+                "exit_code": result.exit_code,
+                "working_directory": result.working_directory,
+                "timed_out": result.timed_out
+            }),
+        )
+        .await
+        .map_err(internal_error)?;
+    Ok(result)
+}
+
 fn internal_error(error: impl std::fmt::Display) -> (StatusCode, String) {
     (StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
+}
+
+fn normalize_relative_workspace_path(path: &str) -> Result<String, (StatusCode, String)> {
+    let value = path.trim().replace('\\', "/");
+    if value.is_empty() {
+        return Ok(String::new());
+    }
+    if value.starts_with('/') {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "path must be relative to workspace root".to_string(),
+        ));
+    }
+    let clean_segments = value
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+    if clean_segments.iter().any(|segment| *segment == "..") {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "path must not escape workspace root".to_string(),
+        ));
+    }
+    Ok(clean_segments.join("/"))
 }
 
 fn canonicalize_workspace_root(workspace: &Workspace) -> Result<PathBuf, (StatusCode, String)> {

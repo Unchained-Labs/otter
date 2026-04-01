@@ -38,6 +38,10 @@ pub struct Job {
     pub workspace_id: Uuid,
     pub prompt: String,
     pub preview_url: Option<String>,
+    pub project_path: Option<String>,
+    pub runtime_start_command: Option<String>,
+    pub runtime_stop_command: Option<String>,
+    pub runtime_command_cwd: Option<String>,
     pub is_paused: bool,
     pub status: JobStatus,
     pub priority: i32,
@@ -91,6 +95,9 @@ pub struct EnqueuePromptRequest {
     pub prompt: String,
     pub priority: Option<i32>,
     pub schedule_at: Option<DateTime<Utc>>,
+    #[validate(length(max = 4096))]
+    pub project_path: Option<String>,
+    pub dependency_job_ids: Option<Vec<Uuid>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Validate)]
@@ -115,6 +122,9 @@ pub struct QueueItem {
     pub workspace_id: Uuid,
     pub prompt: String,
     pub is_paused: bool,
+    pub blocked_by_dependencies: bool,
+    pub dependency_count: i64,
+    pub unresolved_dependency_count: i64,
     pub priority: i32,
     pub schedule_at: Option<DateTime<Utc>>,
     pub queue_rank: i64,

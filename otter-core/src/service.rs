@@ -131,12 +131,34 @@ impl<Q: Queue> OtterService<Q> {
                 &request.prompt,
                 request.priority,
                 request.schedule_at,
+                request.project_path.as_deref(),
                 self.max_attempts,
             )
             .await?;
+        if let Some(dependency_ids) = request.dependency_job_ids.as_ref() {
+            self.db.add_job_dependencies(job.id, dependency_ids).await?;
+        }
         self.db
             .insert_job_event(job.id, "accepted", serde_json::json!({}))
             .await?;
+        if let Some(project_path) = request.project_path.as_ref() {
+            self.db
+                .insert_job_event(
+                    job.id,
+                    "project_path_set",
+                    serde_json::json!({ "project_path": project_path }),
+                )
+                .await?;
+        }
+        if let Some(dependency_ids) = request.dependency_job_ids.as_ref() {
+            self.db
+                .insert_job_event(
+                    job.id,
+                    "dependencies_set",
+                    serde_json::json!({ "dependency_job_ids": dependency_ids }),
+                )
+                .await?;
+        }
         self.queue
             .enqueue(DEFAULT_QUEUE_NAME, &QueueMessage { job_id: job.id })
             .await?;
@@ -319,7 +341,14 @@ impl<Q: Queue> OtterService<Q> {
                         .unwrap_or(false);
                 let should_requeue_for_pause =
                     matches!(job_state.status, JobStatus::Queued) && job_state.is_paused;
-                if should_requeue_for_schedule || should_requeue_for_pause {
+                let should_requeue_for_dependency = matches!(job_state.status, JobStatus::Queued)
+                    && !job_state.is_paused
+                    && !should_requeue_for_schedule
+                    && self.db.has_unresolved_dependencies(message.job_id).await?;
+                if should_requeue_for_schedule
+                    || should_requeue_for_pause
+                    || should_requeue_for_dependency
+                {
                     info!(job_id = %message.job_id, "job not runnable yet; requeued message");
                     self.queue
                         .enqueue(
@@ -333,6 +362,7 @@ impl<Q: Queue> OtterService<Q> {
                         job_id = %message.job_id,
                         schedule_at = ?job_state.schedule_at,
                         is_paused = job_state.is_paused,
+                        blocked_by_dependencies = should_requeue_for_dependency,
                         "job is not runnable yet; re-queued"
                     );
                 }
@@ -447,6 +477,7 @@ impl<Q: Queue> OtterService<Q> {
                 job.id,
                 &workspace_path,
                 &isolated_vibe_home,
+                job.project_path.as_deref(),
                 |chunk: VibeOutputChunk| {
                     let chunk_counter = chunk_counter.clone();
                     async move {
@@ -466,7 +497,7 @@ impl<Q: Queue> OtterService<Q> {
                 },
                 || async {
                     let status = self.db.fetch_job(job.id).await?.map(|value| value.status);
-                    Ok(matches!(status, Some(JobStatus::Cancelled)))
+                    Ok(!matches!(status, Some(JobStatus::Running)))
                 },
             )
             .await?;
@@ -964,6 +995,16 @@ impl<Q: Queue> OtterService<Q> {
                 .await?;
             self.queue
                 .enqueue(DEFAULT_QUEUE_NAME, &QueueMessage { job_id })
+                .await?;
+        }
+        Ok(updated)
+    }
+
+    pub async fn hold_job(&self, job_id: Uuid) -> Result<bool> {
+        let updated = self.db.hold_job(job_id).await?;
+        if updated {
+            self.db
+                .insert_job_event(job_id, "on_hold", serde_json::json!({}))
                 .await?;
         }
         Ok(updated)
