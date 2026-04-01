@@ -115,6 +115,7 @@ impl VibeExecutor {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn run_prompt_streaming<F, Fut, C, CFut>(
         &self,
         prompt: &str,
