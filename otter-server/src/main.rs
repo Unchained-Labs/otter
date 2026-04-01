@@ -171,6 +171,21 @@ struct SetJobProjectPathRequest {
 }
 
 #[derive(serde::Deserialize)]
+struct SetJobDependenciesRequest {
+    dependency_job_ids: Vec<Uuid>,
+}
+
+fn validate_dependency_job_ids(ids: &[Uuid]) -> Result<(), (StatusCode, String)> {
+    if ids.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "dependency_job_ids must not be empty".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+#[derive(serde::Deserialize)]
 struct SetJobRuntimeLaunchRequest {
     start_command: String,
     stop_command: Option<String>,
@@ -257,6 +272,7 @@ async fn main() -> Result<()> {
         .route("/v1/jobs/{id}/events", get(get_job_events))
         .route("/v1/jobs/{id}/preview-url", post(set_job_preview_url))
         .route("/v1/jobs/{id}/project-path", post(set_job_project_path))
+        .route("/v1/jobs/{id}/dependencies", post(set_job_dependencies))
         .route("/v1/jobs/{id}/runtime-launch", post(set_job_runtime_launch))
         .route(
             "/v1/jobs/{id}/runtime-launch/start",
@@ -1070,6 +1086,56 @@ async fn set_job_project_path(
         .await
         .map_err(internal_error)?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+async fn set_job_dependencies(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(body): Json<SetJobDependenciesRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    validate_dependency_job_ids(&body.dependency_job_ids)?;
+
+    state
+        .service
+        .db
+        .add_job_dependencies(id, &body.dependency_job_ids)
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("invalid job dependencies: {error}"),
+            )
+        })?;
+
+    state
+        .service
+        .db
+        .insert_job_event(
+            id,
+            "dependencies_set",
+            serde_json::json!({ "dependency_job_ids": body.dependency_job_ids }),
+        )
+        .await
+        .map_err(internal_error)?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[cfg(test)]
+mod dependency_tests {
+    use super::*;
+
+    #[test]
+    fn validate_dependency_job_ids_rejects_empty() {
+        let err = validate_dependency_job_ids(&[]).unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn validate_dependency_job_ids_accepts_non_empty() {
+        let id = Uuid::new_v4();
+        validate_dependency_job_ids(&[id]).unwrap();
+    }
 }
 
 async fn set_job_runtime_launch(
