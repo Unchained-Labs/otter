@@ -20,7 +20,7 @@ use crate::db::Database;
 use crate::domain::{
     CreateProjectRequest, CreateWorkspaceRequest, EnqueuePromptRequest, Job, JobEvent, JobStatus,
     Project, QueueItem, RuntimeContainerInfo, RuntimeContainerStatus, UpdateQueuePositionRequest,
-    Workspace,
+    Workspace, WORKSPACE_ROOT_MARKER_FILE,
 };
 use crate::queue::{Queue, QueueMessage};
 use crate::runtime::docker_manager::{DockerRuntimeManager, RuntimeExecResult};
@@ -99,6 +99,16 @@ impl<Q: Queue> OtterService<Q> {
             .workspace_manager
             .validate_workspace_path(PathBuf::from(&request.root_path).as_path())?;
         let workspace_id = Uuid::new_v4();
+
+        // Marker file used by runtime/project guardrails for safe cleanup defaults.
+        let marker_path = canonical.join(WORKSPACE_ROOT_MARKER_FILE);
+        if !marker_path.exists() {
+            fs::write(
+                &marker_path,
+                format!("managed=true\nworkspace_id={workspace_id}\n"),
+            )?;
+        }
+
         let isolated_vibe_home = self
             .workspace_manager
             .prepare_isolated_vibe_home(workspace_id, &canonical)

@@ -6,6 +6,7 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 - Persistent runtime app registry (workspace + job runtime instances) plus shutdown-all endpoint.
+- Guardrails to ensure runtime `working_directory` and job `project_path` point to self-contained compose folders; workspace root marker file is created during workspace creation.
 
 ## [1.0.0] - 2026-04-01
 
