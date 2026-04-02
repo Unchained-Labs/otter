@@ -1,12 +1,15 @@
 use anyhow::{bail, Result};
+use serde_json::Value;
 use sqlx::postgres::{PgPoolOptions, PgQueryResult};
 use sqlx::PgPool;
+use sqlx::Row;
 use std::path::PathBuf;
 use uuid::Uuid;
 
 use crate::domain::{
-    CreateProjectRequest, CreateWorkspaceRequest, HistoryItem, Job, JobEvent, JobOutput, JobStatus,
-    Project, QueueItem, Workspace,
+    CreateProjectRequest, CreateWorkspaceRequest, HistoryItem, Job, JobEvent, JobOutput,
+    JobRuntimeAppRegistryEntry, JobStatus, Project, QueueItem, RuntimePortBinding, Workspace,
+    WorkspaceRuntimeRegistryEntry,
 };
 
 #[derive(Clone)]
@@ -665,5 +668,217 @@ impl Database {
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected() > 0)
+    }
+
+    fn ports_to_json(ports: &[RuntimePortBinding]) -> Result<Value> {
+        serde_json::to_value(ports).map_err(|error| anyhow::anyhow!(error))
+    }
+
+    fn ports_from_json(ports: Value) -> Result<Vec<RuntimePortBinding>> {
+        serde_json::from_value(ports).map_err(|error| anyhow::anyhow!(error))
+    }
+
+    pub async fn upsert_workspace_runtime_registry(
+        &self,
+        workspace_id: Uuid,
+        container_name: &str,
+        image_tag: &str,
+        status: &str,
+        preferred_url: Option<&str>,
+        ports: &[RuntimePortBinding],
+    ) -> Result<()> {
+        let ports_json = Self::ports_to_json(ports)?;
+        sqlx::query(
+            r#"
+            INSERT INTO workspace_runtime_registry (
+                workspace_id,
+                container_name,
+                image_tag,
+                status,
+                preferred_url,
+                ports,
+                updated_at
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, now())
+            ON CONFLICT (workspace_id) DO UPDATE SET
+                container_name = EXCLUDED.container_name,
+                image_tag = EXCLUDED.image_tag,
+                status = EXCLUDED.status,
+                preferred_url = EXCLUDED.preferred_url,
+                ports = EXCLUDED.ports,
+                updated_at = now()
+            "#,
+        )
+        .bind(workspace_id)
+        .bind(container_name)
+        .bind(image_tag)
+        .bind(status)
+        .bind(preferred_url)
+        .bind(ports_json)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn upsert_job_runtime_app_registry(
+        &self,
+        job_id: Uuid,
+        workspace_id: Uuid,
+        working_directory: Option<&str>,
+        start_command: &str,
+        stop_command: Option<&str>,
+        status: &str,
+        preferred_url: Option<&str>,
+        ports: &[RuntimePortBinding],
+    ) -> Result<()> {
+        let ports_json = Self::ports_to_json(ports)?;
+        sqlx::query(
+            r#"
+            INSERT INTO job_runtime_app_registry (
+                job_id,
+                workspace_id,
+                working_directory,
+                start_command,
+                stop_command,
+                status,
+                preferred_url,
+                ports,
+                updated_at
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now())
+            ON CONFLICT (job_id) DO UPDATE SET
+                workspace_id = EXCLUDED.workspace_id,
+                working_directory = EXCLUDED.working_directory,
+                start_command = EXCLUDED.start_command,
+                stop_command = EXCLUDED.stop_command,
+                status = EXCLUDED.status,
+                preferred_url = EXCLUDED.preferred_url,
+                ports = EXCLUDED.ports,
+                updated_at = now()
+            "#,
+        )
+        .bind(job_id)
+        .bind(workspace_id)
+        .bind(working_directory)
+        .bind(start_command)
+        .bind(stop_command)
+        .bind(status)
+        .bind(preferred_url)
+        .bind(ports_json)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn list_workspace_runtime_registries(
+        &self,
+    ) -> Result<Vec<WorkspaceRuntimeRegistryEntry>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT
+                workspace_id,
+                container_name,
+                image_tag,
+                status,
+                preferred_url,
+                ports
+            FROM workspace_runtime_registry
+            ORDER BY updated_at DESC
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let workspace_id: Uuid = row.try_get("workspace_id")?;
+            let container_name: String = row.try_get("container_name")?;
+            let image_tag: String = row.try_get("image_tag")?;
+            let status: String = row.try_get("status")?;
+            let preferred_url: Option<String> = row.try_get("preferred_url")?;
+            let ports_json: Value = row.try_get("ports")?;
+            let ports = Self::ports_from_json(ports_json)?;
+
+            out.push(WorkspaceRuntimeRegistryEntry {
+                workspace_id,
+                container_name,
+                image_tag,
+                status,
+                preferred_url,
+                ports,
+            });
+        }
+
+        Ok(out)
+    }
+
+    pub async fn list_job_runtime_app_registries(&self) -> Result<Vec<JobRuntimeAppRegistryEntry>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT
+                job_id,
+                workspace_id,
+                working_directory,
+                start_command,
+                stop_command,
+                status,
+                preferred_url,
+                ports
+            FROM job_runtime_app_registry
+            ORDER BY updated_at DESC
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let job_id: Uuid = row.try_get("job_id")?;
+            let workspace_id: Uuid = row.try_get("workspace_id")?;
+            let working_directory: Option<String> = row.try_get("working_directory")?;
+            let start_command: String = row.try_get("start_command")?;
+            let stop_command: Option<String> = row.try_get("stop_command")?;
+            let status: String = row.try_get("status")?;
+            let preferred_url: Option<String> = row.try_get("preferred_url")?;
+            let ports_json: Value = row.try_get("ports")?;
+            let ports = Self::ports_from_json(ports_json)?;
+
+            out.push(JobRuntimeAppRegistryEntry {
+                job_id,
+                workspace_id,
+                working_directory,
+                start_command,
+                stop_command,
+                status,
+                preferred_url,
+                ports,
+            });
+        }
+
+        Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod registry_tests {
+    use super::Database;
+    use crate::domain::RuntimePortBinding;
+
+    #[test]
+    fn ports_roundtrip_serializes_and_parses() {
+        let ports = vec![RuntimePortBinding {
+            container_port: 3000,
+            host_ip: "0.0.0.0".to_string(),
+            host_port: 49162,
+        }];
+
+        let json = Database::ports_to_json(&ports).unwrap();
+        let parsed = Database::ports_from_json(json).unwrap();
+
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].container_port, 3000);
+        assert_eq!(parsed[0].host_ip, "0.0.0.0");
+        assert_eq!(parsed[0].host_port, 49162);
     }
 }

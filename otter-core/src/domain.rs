@@ -156,3 +156,31 @@ pub struct RuntimeContainerInfo {
     pub ports: Vec<RuntimePortBinding>,
     pub preferred_url: Option<String>,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceRuntimeRegistryEntry {
+    pub workspace_id: Uuid,
+    pub container_name: String,
+    pub image_tag: String,
+    pub status: String,
+    pub preferred_url: Option<String>,
+    pub ports: Vec<RuntimePortBinding>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JobRuntimeAppRegistryEntry {
+    pub job_id: Uuid,
+    pub workspace_id: Uuid,
+    pub working_directory: Option<String>,
+    pub start_command: String,
+    pub stop_command: Option<String>,
+    pub status: String,
+    pub preferred_url: Option<String>,
+    pub ports: Vec<RuntimePortBinding>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuntimeAppRegistryResponse {
+    pub workspaces: Vec<WorkspaceRuntimeRegistryEntry>,
+    pub jobs: Vec<JobRuntimeAppRegistryEntry>,
+}

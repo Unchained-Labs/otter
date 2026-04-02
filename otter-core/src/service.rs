@@ -552,6 +552,30 @@ impl<Q: Queue> OtterService<Q> {
                 .await
             {
                 Ok(runtime_info) => {
+                    let runtime_status = match runtime_info.status {
+                        RuntimeContainerStatus::Running => "running",
+                        RuntimeContainerStatus::Stopped => "stopped",
+                        RuntimeContainerStatus::Missing => "missing",
+                    };
+                    if let Err(error) = self
+                        .db
+                        .upsert_workspace_runtime_registry(
+                            workspace.id,
+                            &runtime_info.container_name,
+                            &runtime_info.image_tag,
+                            runtime_status,
+                            runtime_info.preferred_url.as_deref(),
+                            &runtime_info.ports,
+                        )
+                        .await
+                    {
+                        warn!(
+                            workspace_id = %workspace.id,
+                            error = %error,
+                            "failed to upsert workspace runtime registry"
+                        );
+                    }
+
                     self.db
                         .insert_job_event(
                             job.id,
