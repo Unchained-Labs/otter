@@ -20,6 +20,7 @@ use otter_core::db::Database;
 use otter_core::domain::{
     CreateProjectRequest, CreateWorkspaceRequest, EnqueuePromptRequest, Job, JobEvent, JobOutput,
     QueueItem, RuntimeAppRegistryResponse, UpdateQueuePositionRequest, Workspace,
+    WORKSPACE_ROOT_MARKER_FILE,
 };
 use otter_core::queue::RedisQueue;
 use otter_core::runtime::docker_manager::split_stdout_and_cwd;
@@ -1071,6 +1072,31 @@ async fn set_job_project_path(
     Json(body): Json<SetJobProjectPathRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let project_path = normalize_relative_workspace_path(body.project_path.as_str())?;
+
+    if project_path.trim().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "project_path must point to a self-contained project folder".to_string(),
+        ));
+    }
+
+    let job = state
+        .service
+        .db
+        .fetch_job(id)
+        .await
+        .map_err(internal_error)?
+        .ok_or((StatusCode::NOT_FOUND, "job not found".to_string()))?;
+    let workspace = state
+        .service
+        .db
+        .fetch_workspace(job.workspace_id)
+        .await
+        .map_err(internal_error)?
+        .ok_or((StatusCode::NOT_FOUND, "workspace not found".to_string()))?;
+
+    validate_self_contained_compose_dir(&workspace, &project_path)?;
+
     let updated = state
         .service
         .db
@@ -1149,6 +1175,7 @@ async fn set_job_runtime_launch(
     Json(body): Json<SetJobRuntimeLaunchRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let start_command = body.start_command.trim();
+    let working_directory_was_provided = body.working_directory.is_some();
     if start_command.is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -1165,6 +1192,34 @@ async fn set_job_runtime_launch(
         .as_deref()
         .map(normalize_relative_workspace_path)
         .transpose()?;
+
+    if working_directory_was_provided {
+        let working_directory_value = working_directory.as_deref().unwrap_or("");
+        if working_directory_value.is_empty() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "working_directory must point to a self-contained project folder".to_string(),
+            ));
+        }
+
+        let job = state
+            .service
+            .db
+            .fetch_job(id)
+            .await
+            .map_err(internal_error)?
+            .ok_or((StatusCode::NOT_FOUND, "job not found".to_string()))?;
+        let workspace = state
+            .service
+            .db
+            .fetch_workspace(job.workspace_id)
+            .await
+            .map_err(internal_error)?
+            .ok_or((StatusCode::NOT_FOUND, "workspace not found".to_string()))?;
+
+        validate_self_contained_compose_dir(&workspace, working_directory_value)?;
+    }
+
     let updated = state
         .service
         .db
@@ -1589,6 +1644,51 @@ fn normalize_relative_workspace_path(path: &str) -> Result<String, (StatusCode, 
     Ok(clean_segments.join("/"))
 }
 
+fn workspace_root_marker_exists(workspace: &Workspace) -> bool {
+    FsPath::new(&workspace.root_path)
+        .join(WORKSPACE_ROOT_MARKER_FILE)
+        .exists()
+}
+
+fn validate_self_contained_compose_dir(
+    workspace: &Workspace,
+    relative_dir: &str,
+) -> Result<(), (StatusCode, String)> {
+    if relative_dir.trim().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "path must point to a self-contained project folder, not workspace root".to_string(),
+        ));
+    }
+
+    if !workspace_root_marker_exists(workspace) {
+        // Non-fatal: we still enforce compose-file presence to avoid breaking older workspaces.
+        warn!(
+            workspace_root = %workspace.root_path,
+            "workspace root marker missing; consider recreating the workspace to enable safe cleanup defaults"
+        );
+    }
+
+    let resolved_dir = resolve_workspace_subpath(workspace, relative_dir)?;
+    if !resolved_dir.is_dir() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "path must resolve to a directory".to_string(),
+        ));
+    }
+
+    let has_docker_compose_yml = resolved_dir.join("docker-compose.yml").exists();
+    let has_compose_yaml = resolved_dir.join("compose.yaml").exists();
+    if !has_docker_compose_yml && !has_compose_yaml {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "project directory must contain docker-compose.yml or compose.yaml".to_string(),
+        ));
+    }
+
+    Ok(())
+}
+
 fn canonicalize_workspace_root(workspace: &Workspace) -> Result<PathBuf, (StatusCode, String)> {
     let root = fs::canonicalize(&workspace.root_path)
         .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
@@ -1659,7 +1759,16 @@ fn list_workspace_entries(
 
 #[cfg(test)]
 mod tests {
-    use super::split_stdout_and_cwd;
+    use super::Workspace;
+    use super::WORKSPACE_ROOT_MARKER_FILE;
+    use super::{
+        normalize_relative_workspace_path, split_stdout_and_cwd,
+        validate_self_contained_compose_dir,
+    };
+    use axum::http::StatusCode;
+    use chrono::Utc;
+    use std::fs;
+    use uuid::Uuid;
 
     #[test]
     fn strips_cwd_marker_from_stdout() {
@@ -1667,5 +1776,79 @@ mod tests {
         let (cleaned, cwd) = split_stdout_and_cwd(stdout, "/fallback");
         assert_eq!(cleaned, "hello\n");
         assert_eq!(cwd, "/tmp/demo");
+    }
+
+    fn temp_workspace_root() -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("otter-guardrails-{}", Uuid::new_v4().as_simple()));
+        fs::create_dir_all(&dir).expect("create temp workspace root");
+        dir
+    }
+
+    fn workspace_from_root(root_path: &std::path::Path) -> Workspace {
+        Workspace {
+            id: Uuid::new_v4(),
+            project_id: Uuid::new_v4(),
+            name: "temp-workspace".to_string(),
+            root_path: root_path.to_string_lossy().to_string(),
+            isolated_vibe_home: root_path.join(".vibe").to_string_lossy().to_string(),
+            created_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn normalize_relative_workspace_path_rejects_absolute_paths() {
+        let err = normalize_relative_workspace_path("/etc/passwd").unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn normalize_relative_workspace_path_rejects_parent_segments() {
+        let err = normalize_relative_workspace_path("a/../b").unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn validate_self_contained_compose_dir_rejects_missing_compose_file() {
+        let root = temp_workspace_root();
+        fs::write(root.join(WORKSPACE_ROOT_MARKER_FILE), "managed=true\n").unwrap();
+
+        fs::create_dir_all(root.join("proj")).unwrap();
+
+        let workspace = workspace_from_root(&root);
+        let err = validate_self_contained_compose_dir(&workspace, "proj").unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(err.1.contains("docker-compose.yml") || err.1.contains("compose.yaml"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn validate_self_contained_compose_dir_accepts_docker_compose_yml() {
+        let root = temp_workspace_root();
+        fs::write(root.join(WORKSPACE_ROOT_MARKER_FILE), "managed=true\n").unwrap();
+
+        let proj = root.join("proj");
+        fs::create_dir_all(&proj).unwrap();
+        fs::write(proj.join("docker-compose.yml"), "version: '3'\n").unwrap();
+
+        let workspace = workspace_from_root(&root);
+        validate_self_contained_compose_dir(&workspace, "proj").unwrap();
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn validate_self_contained_compose_dir_allows_when_workspace_marker_missing() {
+        let root = temp_workspace_root();
+
+        let proj = root.join("proj");
+        fs::create_dir_all(&proj).unwrap();
+        fs::write(proj.join("docker-compose.yml"), "version: '3'\n").unwrap();
+
+        let workspace = workspace_from_root(&root);
+        validate_self_contained_compose_dir(&workspace, "proj").unwrap();
+
+        let _ = fs::remove_dir_all(&root);
     }
 }
