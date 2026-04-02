@@ -19,7 +19,7 @@ use otter_core::config::AppConfig;
 use otter_core::db::Database;
 use otter_core::domain::{
     CreateProjectRequest, CreateWorkspaceRequest, EnqueuePromptRequest, Job, JobEvent, JobOutput,
-    QueueItem, UpdateQueuePositionRequest, Workspace,
+    QueueItem, RuntimeAppRegistryResponse, UpdateQueuePositionRequest, Workspace,
 };
 use otter_core::queue::RedisQueue;
 use otter_core::runtime::docker_manager::split_stdout_and_cwd;
@@ -261,6 +261,11 @@ async fn main() -> Result<()> {
         .route(
             "/v1/runtime/workspaces/{id}/logs",
             get(get_runtime_workspace_logs),
+        )
+        .route("/v1/runtime/app-registry", get(get_runtime_app_registry))
+        .route(
+            "/v1/runtime/apps/shutdown-all",
+            post(shutdown_all_runtime_apps),
         )
         .route(
             "/v1/runtime/workspaces/{id}/shell/ws",
@@ -1205,6 +1210,128 @@ async fn stop_job_runtime_launch(
     execute_job_runtime_launch(state, id, false).await.map(Json)
 }
 
+#[derive(serde::Serialize)]
+struct RuntimeAppRegistryShutdownSummary {
+    stopped_jobs: i64,
+    stopped_workspaces: i64,
+}
+
+async fn get_runtime_app_registry(
+    State(state): State<AppState>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let workspace_registries = state
+        .service
+        .db
+        .list_workspace_runtime_registries()
+        .await
+        .map_err(internal_error)?;
+    let job_registries = state
+        .service
+        .db
+        .list_job_runtime_app_registries()
+        .await
+        .map_err(internal_error)?;
+
+    let running_workspaces = workspace_registries
+        .into_iter()
+        .filter(|entry| entry.status == "running")
+        .collect::<Vec<_>>();
+    let running_jobs = job_registries
+        .into_iter()
+        .filter(|entry| entry.status == "running")
+        .collect::<Vec<_>>();
+
+    Ok(Json(RuntimeAppRegistryResponse {
+        workspaces: running_workspaces,
+        jobs: running_jobs,
+    }))
+}
+
+async fn shutdown_all_runtime_apps(
+    State(state): State<AppState>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    if !state.service.runtime_enabled() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "runtime is not enabled".to_string(),
+        ));
+    }
+
+    let job_registries = state
+        .service
+        .db
+        .list_job_runtime_app_registries()
+        .await
+        .map_err(internal_error)?;
+    let running_jobs = job_registries
+        .into_iter()
+        .filter(|entry| entry.status == "running")
+        .collect::<Vec<_>>();
+
+    // Stop job-level app instances first so they can release ports cleanly.
+    let mut stopped_jobs: i64 = 0;
+    let mut workspaces_to_stop: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
+    for entry in running_jobs.iter() {
+        workspaces_to_stop.insert(entry.workspace_id);
+        match execute_job_runtime_launch(state.clone(), entry.job_id, false).await {
+            Ok(_) => stopped_jobs += 1,
+            Err(error) => {
+                warn!(
+                    job_id = %entry.job_id,
+                    error = %error.1,
+                    "failed to stop job runtime app instance during shutdown-all"
+                );
+            }
+        }
+    }
+
+    // Then stop the workspace runtime containers themselves.
+    let mut stopped_workspaces: i64 = 0;
+    for workspace_id in workspaces_to_stop {
+        match state.service.runtime_stop_for_workspace(workspace_id).await {
+            Ok(runtime_info) => {
+                let runtime_status = match runtime_info.status {
+                    otter_core::domain::RuntimeContainerStatus::Running => "running",
+                    otter_core::domain::RuntimeContainerStatus::Stopped => "stopped",
+                    otter_core::domain::RuntimeContainerStatus::Missing => "missing",
+                };
+                if let Err(error) = state
+                    .service
+                    .db
+                    .upsert_workspace_runtime_registry(
+                        workspace_id,
+                        &runtime_info.container_name,
+                        &runtime_info.image_tag,
+                        runtime_status,
+                        runtime_info.preferred_url.as_deref(),
+                        &runtime_info.ports,
+                    )
+                    .await
+                {
+                    warn!(
+                        workspace_id = %workspace_id,
+                        error = %error,
+                        "failed to upsert workspace runtime registry during shutdown-all"
+                    );
+                }
+                stopped_workspaces += 1;
+            }
+            Err(error) => {
+                warn!(
+                    workspace_id = %workspace_id,
+                    error = %error,
+                    "failed to stop runtime workspace container during shutdown-all"
+                );
+            }
+        }
+    }
+
+    Ok(Json(RuntimeAppRegistryShutdownSummary {
+        stopped_jobs,
+        stopped_workspaces,
+    }))
+}
+
 async fn set_job_preview_url(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -1377,6 +1504,60 @@ async fn execute_job_runtime_launch(
         )
         .await
         .map_err(internal_error)?;
+
+    // Keep the job-level app registry in sync with runtime start/stop.
+    let job_registry_status = if start { "running" } else { "stopped" };
+    let runtime_ports;
+    let runtime_preferred_url;
+    if state.service.runtime_enabled() {
+        match state
+            .service
+            .runtime_status_for_workspace(job.workspace_id)
+            .await
+        {
+            Ok(runtime_info) => {
+                runtime_ports = runtime_info.ports;
+                runtime_preferred_url = runtime_info.preferred_url;
+            }
+            Err(error) => {
+                warn!(
+                    workspace_id = %job.workspace_id,
+                    job_id = %job_id,
+                    error = %error,
+                    "failed to resolve runtime status for job app registry upsert"
+                );
+                runtime_ports = Vec::new();
+                runtime_preferred_url = None;
+            }
+        }
+    } else {
+        runtime_ports = Vec::new();
+        runtime_preferred_url = None;
+    }
+
+    let start_command = job.runtime_start_command.clone().unwrap_or_default();
+    if let Err(error) = state
+        .service
+        .db
+        .upsert_job_runtime_app_registry(
+            job_id,
+            job.workspace_id,
+            job.runtime_command_cwd.as_deref(),
+            &start_command,
+            job.runtime_stop_command.as_deref(),
+            job_registry_status,
+            runtime_preferred_url.as_deref(),
+            &runtime_ports,
+        )
+        .await
+    {
+        warn!(
+            workspace_id = %job.workspace_id,
+            job_id = %job_id,
+            error = %error,
+            "failed to upsert job runtime app registry"
+        );
+    }
     Ok(result)
 }
 

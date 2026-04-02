@@ -2,7 +2,10 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]\n\n## [1.0.1] - 2026-04-01\n\n## [1.0.0] - 2026-04-01
+## [Unreleased]
+
+### Added
+- Persistent runtime app registry (workspace + job runtime instances) plus shutdown-all endpoint.
 
 ## [1.0.0] - 2026-04-01
 
