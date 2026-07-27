@@ -13,7 +13,6 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use chrono::{Duration, Utc};
 use futures_util::StreamExt;
 use otter_core::config::AppConfig;
 use otter_core::db::Database;
@@ -1462,25 +1461,43 @@ async fn get_queue(
     Ok(Json(items))
 }
 
+#[derive(serde::Deserialize)]
+struct StreamEventsQuery {
+    /// Restrict the stream to a single job. Omit to receive every job's events.
+    job_id: Option<Uuid>,
+}
+
 async fn stream_job_events(
     State(state): State<AppState>,
+    Query(query): Query<StreamEventsQuery>,
 ) -> Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>> {
+    const STREAM_PAGE_SIZE: i64 = 200;
+
     let stream = async_stream::stream! {
-        let mut since = Utc::now() - Duration::seconds(5);
+        // Start at the current tail so a reconnecting client is not replayed the
+        // whole backlog, then page forward on the monotonic `seq` cursor.
+        let mut cursor = state.service.latest_job_event_seq().await.unwrap_or(0);
+        let job_filter = query.job_id;
+
         loop {
             let events = state
                 .service
-                .fetch_job_events_since(since, 200)
+                .fetch_job_events_after_seq(cursor, job_filter, STREAM_PAGE_SIZE)
                 .await
                 .unwrap_or_default();
 
+            let batch_size = events.len() as i64;
+
             for event in events {
-                since = event.created_at;
+                cursor = event.seq;
                 let payload = serde_json::to_string(&event).unwrap_or_else(|_| "{}".to_string());
                 yield Ok(Event::default().event(event.event_type.clone()).data(payload));
             }
 
-            tokio::time::sleep(TokioDuration::from_secs(1)).await;
+            // A full page means the log is ahead of us; drain it before idling.
+            if batch_size < STREAM_PAGE_SIZE {
+                tokio::time::sleep(TokioDuration::from_secs(1)).await;
+            }
         }
     };
 

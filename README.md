@@ -101,7 +101,7 @@ These are forwarded as `VIBE_MODEL` / `MISTRAL_MODEL` and `VIBE_PROVIDER` for co
 - `POST /v1/prompts` (`workspace_id` optional when `OTTER_DEFAULT_WORKSPACE_PATH` is configured)
 - `GET /v1/jobs/{id}`
 - `GET /v1/jobs/{id}/events`
-- `GET /v1/events/stream` (includes `output_chunk` events)
+- `GET /v1/events/stream` (includes `output_chunk` events; optional `?job_id=` filters to a single job)
 - `POST /v1/jobs/{id}/cancel`
 - `POST /v1/jobs/{id}/pause`
 - `POST /v1/jobs/{id}/resume`

@@ -71,6 +71,8 @@ pub struct JobEvent {
     pub event_type: String,
     pub payload: serde_json::Value,
     pub created_at: DateTime<Utc>,
+    /// Monotonic stream cursor. Unique per event, unlike `created_at`.
+    pub seq: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Validate)]

@@ -94,6 +94,10 @@ Base URL: `http://<host>:8080`
 - `GET /v1/events/stream`
   - Server-Sent Events stream of job lifecycle events for live UI updates.
   - Includes incremental `output_chunk` events (`stdout` / `stderr`) during Vibe execution.
+  - Optional `job_id` query parameter restricts the stream to a single job.
+  - Events carry a monotonic `seq`; the stream pages on it, so no event is skipped
+    when several land in the same microsecond.
+  - A new connection starts at the current tail rather than replaying the backlog.
 
 ## History
 
@@ -110,6 +114,8 @@ Base URL: `http://<host>:8080`
     { "priority": 10 }
     ```
   - Repositions queued jobs by updating priority.
+  - Workers claim the runnable job with the lowest `priority` (ties broken by
+    `created_at`), so repositioning changes execution order, not just display order.
 
 ## Operational Visibility
 

@@ -237,10 +237,10 @@ impl Database {
     pub async fn list_job_events(&self, job_id: Uuid) -> Result<Vec<JobEvent>> {
         let events = sqlx::query_as::<_, JobEvent>(
             r#"
-            SELECT id, job_id, event_type, payload, created_at
+            SELECT id, job_id, event_type, payload, created_at, seq
             FROM job_events
             WHERE job_id = $1
-            ORDER BY created_at ASC
+            ORDER BY seq ASC
             "#,
         )
         .bind(job_id)
@@ -249,21 +249,36 @@ impl Database {
         Ok(events)
     }
 
-    pub async fn list_job_events_since(
+    /// Highest sequence currently stored, used to position a new stream at the tail.
+    pub async fn latest_job_event_seq(&self) -> Result<i64> {
+        let seq = sqlx::query_scalar::<_, Option<i64>>("SELECT MAX(seq) FROM job_events")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(seq.unwrap_or(0))
+    }
+
+    /// Page forward through the event log using the monotonic `seq` cursor.
+    ///
+    /// Paging on `created_at` skipped events that shared a timestamp with the
+    /// previous batch's last row; `seq` is unique, so no event is ever skipped.
+    pub async fn list_job_events_after_seq(
         &self,
-        since: chrono::DateTime<chrono::Utc>,
+        after_seq: i64,
+        job_id: Option<Uuid>,
         limit: i64,
     ) -> Result<Vec<JobEvent>> {
         let events = sqlx::query_as::<_, JobEvent>(
             r#"
-            SELECT id, job_id, event_type, payload, created_at
+            SELECT id, job_id, event_type, payload, created_at, seq
             FROM job_events
-            WHERE created_at > $1
-            ORDER BY created_at ASC
-            LIMIT $2
+            WHERE seq > $1
+              AND ($2::uuid IS NULL OR job_id = $2)
+            ORDER BY seq ASC
+            LIMIT $3
             "#,
         )
-        .bind(since)
+        .bind(after_seq)
+        .bind(job_id)
         .bind(limit)
         .fetch_all(&self.pool)
         .await?;
@@ -291,27 +306,41 @@ impl Database {
         Ok(event)
     }
 
-    pub async fn claim_queued_job_by_id(&self, job_id: Uuid) -> Result<Option<Job>> {
+    /// Claim the highest-priority runnable job.
+    ///
+    /// Execution order is decided here, by `priority ASC, created_at ASC`, so that
+    /// reordering the board actually reorders the work. Claiming a job named by a
+    /// queue message instead would pin execution to Redis insertion order and make
+    /// the queue-position API cosmetic.
+    ///
+    /// `FOR UPDATE SKIP LOCKED` lets concurrent workers claim distinct jobs without
+    /// blocking on each other.
+    pub async fn claim_next_runnable_job(&self) -> Result<Option<Job>> {
         let job = sqlx::query_as::<_, Job>(
             r#"
-            UPDATE jobs j
+            UPDATE jobs
             SET status = 'running',
                 updated_at = now()
-            WHERE j.id = $1
-              AND j.status = 'queued'
-              AND j.is_paused = false
-              AND (j.schedule_at IS NULL OR j.schedule_at <= now())
-              AND NOT EXISTS (
-                SELECT 1
-                FROM job_dependencies dep
-                JOIN jobs parent ON parent.id = dep.depends_on_job_id
-                WHERE dep.job_id = j.id
-                  AND parent.status <> 'succeeded'
-              )
-            RETURNING j.id, j.workspace_id, j.prompt, j.preview_url, j.project_path, j.runtime_start_command, j.runtime_stop_command, j.runtime_command_cwd, j.is_paused, j.status, j.priority, j.schedule_at, j.attempts, j.max_attempts, j.error, j.created_at, j.updated_at
+            WHERE id = (
+                SELECT j.id
+                FROM jobs j
+                WHERE j.status = 'queued'
+                  AND j.is_paused = false
+                  AND (j.schedule_at IS NULL OR j.schedule_at <= now())
+                  AND NOT EXISTS (
+                    SELECT 1
+                    FROM job_dependencies dep
+                    JOIN jobs parent ON parent.id = dep.depends_on_job_id
+                    WHERE dep.job_id = j.id
+                      AND parent.status <> 'succeeded'
+                  )
+                ORDER BY j.priority ASC, j.created_at ASC
+                LIMIT 1
+                FOR UPDATE SKIP LOCKED
+            )
+            RETURNING id, workspace_id, prompt, preview_url, project_path, runtime_start_command, runtime_stop_command, runtime_command_cwd, is_paused, status, priority, schedule_at, attempts, max_attempts, error, created_at, updated_at
             "#,
         )
-        .bind(job_id)
         .fetch_optional(&self.pool)
         .await?;
         Ok(job)

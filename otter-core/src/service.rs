@@ -2,15 +2,13 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
 use std::{fs, path::Path};
 
 use anyhow::{anyhow, Result};
-use chrono::Utc;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::Mutex;
-use tokio::time::{interval, sleep, Duration as TokioDuration, MissedTickBehavior};
+use tokio::time::{interval, Duration as TokioDuration, MissedTickBehavior};
 use tracing::{info, warn};
 use uuid::Uuid;
 use validator::Validate;
@@ -336,48 +334,18 @@ impl<Q: Queue> OtterService<Q> {
     }
 
     pub async fn process_next_job(&self) -> Result<Option<Uuid>> {
-        let Some(message) = self.queue.dequeue(DEFAULT_QUEUE_NAME).await? else {
-            sleep(Duration::from_millis(250)).await;
-            return Ok(None);
-        };
-        info!(job_id = %message.job_id, "dequeued job message from redis");
-        let Some(job) = self.db.claim_queued_job_by_id(message.job_id).await? else {
-            warn!(job_id = %message.job_id, "dequeued message could not claim queued job");
-            if let Some(job_state) = self.db.fetch_job(message.job_id).await? {
-                let should_requeue_for_schedule = matches!(job_state.status, JobStatus::Queued)
-                    && job_state
-                        .schedule_at
-                        .map(|at| at > Utc::now())
-                        .unwrap_or(false);
-                let should_requeue_for_pause =
-                    matches!(job_state.status, JobStatus::Queued) && job_state.is_paused;
-                let should_requeue_for_dependency = matches!(job_state.status, JobStatus::Queued)
-                    && !job_state.is_paused
-                    && !should_requeue_for_schedule
-                    && self.db.has_unresolved_dependencies(message.job_id).await?;
-                if should_requeue_for_schedule
-                    || should_requeue_for_pause
-                    || should_requeue_for_dependency
-                {
-                    info!(job_id = %message.job_id, "job not runnable yet; requeued message");
-                    self.queue
-                        .enqueue(
-                            DEFAULT_QUEUE_NAME,
-                            &QueueMessage {
-                                job_id: message.job_id,
-                            },
-                        )
-                        .await?;
-                    info!(
-                        job_id = %message.job_id,
-                        schedule_at = ?job_state.schedule_at,
-                        is_paused = job_state.is_paused,
-                        blocked_by_dependencies = should_requeue_for_dependency,
-                        "job is not runnable yet; re-queued"
-                    );
-                }
-            }
-            sleep(Duration::from_millis(250)).await;
+        // Queue messages are wake-up hints only; the database decides what runs next.
+        //
+        // Draining one hint per iteration keeps the Redis list bounded without tying
+        // execution order to it. A job that is paused, scheduled for later, or blocked
+        // on a dependency is simply not claimed here — previously its message was
+        // popped and immediately re-pushed, which spun the worker against Redis and
+        // Postgres several times a second for as long as the job stayed unrunnable.
+        if let Some(message) = self.queue.dequeue(DEFAULT_QUEUE_NAME).await? {
+            info!(job_id = %message.job_id, "dequeued wake-up hint from redis");
+        }
+
+        let Some(job) = self.db.claim_next_runnable_job().await? else {
             return Ok(None);
         };
         info!(
@@ -870,12 +838,19 @@ impl<Q: Queue> OtterService<Q> {
         self.db.list_job_events(job_id).await
     }
 
-    pub async fn fetch_job_events_since(
+    pub async fn latest_job_event_seq(&self) -> Result<i64> {
+        self.db.latest_job_event_seq().await
+    }
+
+    pub async fn fetch_job_events_after_seq(
         &self,
-        since: chrono::DateTime<chrono::Utc>,
+        after_seq: i64,
+        job_id: Option<Uuid>,
         limit: i64,
     ) -> Result<Vec<JobEvent>> {
-        self.db.list_job_events_since(since, limit).await
+        self.db
+            .list_job_events_after_seq(after_seq, job_id, limit)
+            .await
     }
 
     pub fn runtime_enabled(&self) -> bool {
