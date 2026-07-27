@@ -1,5 +1,5 @@
 [workspace]
-members = ["otter-core", "otter-server", "otter-worker"]
+members = ["otter-complexity", "otter-core", "otter-server", "otter-worker"]
 resolver = "2"
 
 [workspace.package]

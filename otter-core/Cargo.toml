@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+otter-complexity = { path = "../otter-complexity" }
 anyhow.workspace = true
 async-trait.workspace = true
 bollard.workspace = true

@@ -20,7 +20,52 @@ pub struct AppConfig {
     pub otter_api_base_url: String,
     pub max_attempts: i32,
     pub worker_concurrency: usize,
+    pub scheduling: SchedulingConfig,
     pub runtime: RuntimeConfig,
+}
+
+/// How the worker chooses which runnable job to claim next.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SchedulingStrategy {
+    /// Oldest first. Ignores both priority and intensity.
+    Fifo,
+    /// Explicit queue position only, oldest first within a position.
+    Priority,
+    /// Explicit position first, then cheapest work first, with ageing so long
+    /// jobs cannot be starved by a stream of short ones.
+    Smart,
+}
+
+impl SchedulingStrategy {
+    fn from_env_value(raw: &str) -> Self {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "fifo" => Self::Fifo,
+            "priority" => Self::Priority,
+            _ => Self::Smart,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Fifo => "fifo",
+            Self::Priority => "priority",
+            Self::Smart => "smart",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct SchedulingConfig {
+    pub strategy: SchedulingStrategy,
+    /// Every this many seconds spent waiting, a job sheds `aging_step` intensity.
+    ///
+    /// The defaults shed the full 0..=100 range over roughly three hours. Ageing
+    /// much faster than that makes the queue effectively FIFO — a build job that
+    /// runs for an hour would age past every newcomer before it ever gets picked
+    /// — which throws away the throughput gain the scoring exists to provide.
+    pub aging_interval_seconds: i64,
+    /// Intensity shed per ageing interval.
+    pub aging_step: i32,
 }
 
 #[derive(Clone, Debug)]
@@ -93,6 +138,22 @@ impl AppConfig {
                 .ok()
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(1),
+            scheduling: SchedulingConfig {
+                strategy: env::var("OTTER_SCHEDULING_STRATEGY")
+                    .ok()
+                    .map(|value| SchedulingStrategy::from_env_value(&value))
+                    .unwrap_or(SchedulingStrategy::Smart),
+                aging_interval_seconds: env::var("OTTER_SCHEDULING_AGING_SECONDS")
+                    .ok()
+                    .and_then(|value| value.parse::<i64>().ok())
+                    .filter(|value| *value > 0)
+                    .unwrap_or(600),
+                aging_step: env::var("OTTER_SCHEDULING_AGING_STEP")
+                    .ok()
+                    .and_then(|value| value.parse::<i32>().ok())
+                    .filter(|value| *value > 0)
+                    .unwrap_or(5),
+            },
             runtime: RuntimeConfig {
                 enabled: env::var("OTTER_RUNTIME_ENABLED")
                     .ok()

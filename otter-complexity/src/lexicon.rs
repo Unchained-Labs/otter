@@ -1,0 +1,305 @@
+//! The scoring vocabulary.
+//!
+//! Kept apart from the scoring maths so the weights can be read, argued about and
+//! tuned without touching control flow. Every phrase here is lowercase; the
+//! scorer normalises input before matching.
+
+/// How hard the work is to reason about, independent of how much of it there is.
+///
+/// Weights are on the 1..=10 complexity scale: a term's weight is the floor it
+/// argues for, not an amount added, so one mention of "kubernetes" cannot be
+/// out-voted by ten mentions of "button".
+pub const COMPLEXITY_TERMS: &[(&str, f32)] = &[
+    // Cosmetic and copy edits.
+    ("typo", 1.0),
+    ("rename", 1.5),
+    ("readme", 1.5),
+    ("comment", 1.5),
+    ("changelog", 1.5),
+    ("bump", 1.5),
+    ("lint", 2.0),
+    ("format", 2.0),
+    ("colour", 2.0),
+    ("color", 2.0),
+    ("padding", 2.0),
+    ("margin", 2.0),
+    ("label", 2.0),
+    ("tooltip", 2.0),
+    ("placeholder", 2.0),
+    // Ordinary application work.
+    ("endpoint", 3.5),
+    ("form", 3.0),
+    ("button", 2.5),
+    ("page", 3.0),
+    ("route", 3.0),
+    ("crud", 3.5),
+    ("validation", 3.5),
+    ("pagination", 3.5),
+    ("filter", 3.0),
+    ("sort", 3.0),
+    ("upload", 3.5),
+    ("export", 3.0),
+    ("dashboard", 4.0),
+    ("chart", 3.5),
+    ("table", 3.0),
+    // Stateful and integration work.
+    ("database", 4.5),
+    ("postgres", 4.5),
+    ("schema", 4.5),
+    ("migration", 5.0),
+    ("cache", 4.5),
+    ("redis", 4.5),
+    ("queue", 5.0),
+    ("webhook", 4.5),
+    ("integration", 4.5),
+    ("third-party", 4.5),
+    ("oauth", 5.5),
+    ("authentication", 5.5),
+    ("authorization", 5.5),
+    ("permission", 5.0),
+    ("session", 4.5),
+    ("stripe", 5.0),
+    ("payment", 5.5),
+    ("billing", 5.5),
+    ("subscription", 5.0),
+    ("email", 4.0),
+    ("notification", 4.0),
+    ("search", 4.5),
+    ("full-text", 5.0),
+    // Concurrency, protocol and performance work.
+    ("realtime", 6.5),
+    ("real-time", 6.5),
+    ("websocket", 6.0),
+    ("streaming", 6.0),
+    ("concurrency", 7.0),
+    ("concurrent", 6.5),
+    ("parallel", 6.0),
+    ("race condition", 7.5),
+    ("deadlock", 7.5),
+    ("optimisation", 6.0),
+    ("optimization", 6.0),
+    ("performance", 5.5),
+    ("profiling", 5.5),
+    ("benchmark", 5.0),
+    ("throughput", 6.0),
+    ("latency", 5.5),
+    // Security and correctness-critical work.
+    ("encryption", 6.5),
+    ("cryptograph", 7.5),
+    ("security", 6.0),
+    ("vulnerability", 6.5),
+    ("audit", 5.5),
+    ("compliance", 6.0),
+    ("gdpr", 6.0),
+    // Distributed and infrastructural work.
+    ("kubernetes", 7.5),
+    ("terraform", 6.5),
+    ("infrastructure", 6.0),
+    ("distributed", 8.0),
+    ("consensus", 9.0),
+    ("sharding", 8.0),
+    ("replication", 7.5),
+    ("failover", 7.5),
+    ("high availability", 7.5),
+    ("multi-tenant", 7.5),
+    ("multi-region", 8.0),
+    ("scale", 6.0),
+    ("load balanc", 6.0),
+    ("observability", 5.5),
+    ("tracing", 5.0),
+    // Data and modelling work.
+    ("machine learning", 7.5),
+    ("neural", 8.0),
+    ("training", 7.0),
+    ("inference", 6.5),
+    ("embedding", 6.0),
+    ("recommendation", 6.5),
+    ("etl", 5.5),
+    ("pipeline", 5.0),
+    // Language and systems work.
+    ("compiler", 9.0),
+    ("parser", 7.0),
+    ("interpreter", 8.5),
+    ("bytecode", 8.5),
+    ("kernel", 9.0),
+    ("driver", 7.5),
+    ("protocol", 7.0),
+    ("codec", 7.5),
+    // Migration and rework.
+    ("refactor", 5.0),
+    ("rewrite", 6.5),
+    ("migrate", 5.5),
+    ("port", 5.5),
+    ("legacy", 6.0),
+    ("backward compat", 6.5),
+];
+
+/// Terms arguing for a larger volume of work. Weights are on the 1..=10 size
+/// scale and, like complexity terms, act as floors.
+pub const SIZE_TERMS: &[(&str, f32)] = &[
+    ("full stack", 8.0),
+    ("full-stack", 8.0),
+    ("end to end", 7.5),
+    ("end-to-end", 7.5),
+    ("entire", 7.0),
+    ("whole", 6.5),
+    ("complete", 6.0),
+    ("from scratch", 7.5),
+    ("greenfield", 7.5),
+    ("platform", 7.5),
+    ("suite", 7.0),
+    ("system", 6.0),
+    ("service", 5.0),
+    ("microservice", 6.5),
+    ("application", 5.5),
+    ("app", 5.0),
+    ("website", 5.0),
+    ("api", 4.5),
+    ("backend", 5.0),
+    ("frontend", 5.0),
+    ("mobile", 6.0),
+    ("admin panel", 6.5),
+    ("cms", 6.5),
+    ("marketplace", 8.0),
+    ("clone", 7.0),
+    ("mvp", 6.5),
+    ("prototype", 4.5),
+    ("production-ready", 6.5),
+    ("production ready", 6.5),
+    ("deploy", 5.0),
+    ("docker", 4.5),
+    ("ci/cd", 5.5),
+    ("test suite", 5.5),
+    ("unit test", 4.0),
+    ("integration test", 5.0),
+    ("documentation", 4.0),
+    ("monorepo", 6.5),
+];
+
+/// Verbs that cap the work at something small regardless of the nouns around
+/// them: "fix the typo in the kubernetes docs" is a typo fix, not a cluster job.
+pub const MINOR_VERBS: &[&str] = &[
+    "fix typo",
+    "fix the typo",
+    "correct typo",
+    "rename",
+    "bump",
+    "tweak",
+    "adjust",
+    "reword",
+    "rephrase",
+    "capitalise",
+    "capitalize",
+    "indent",
+    "reformat",
+    "delete the",
+    "remove the unused",
+];
+
+/// Phrases that signal an under-specified request. They raise complexity a
+/// little and lower confidence a lot: the estimate is guessing at hidden scope.
+pub const AMBIGUITY_MARKERS: &[&str] = &[
+    "something like",
+    "or something",
+    "etc",
+    "and so on",
+    "maybe",
+    "perhaps",
+    "somehow",
+    "some kind of",
+    "figure out",
+    "as needed",
+    "if possible",
+    "whatever",
+    "you decide",
+    "up to you",
+    "make it nice",
+    "make it better",
+    "improve it",
+];
+
+/// Distinct areas of a system a task can touch. Breadth across these is a strong
+/// size signal — one feature spanning four surfaces is far more work than four
+/// tweaks to one.
+pub const SURFACES: &[(&str, &[&str])] = &[
+    (
+        "frontend",
+        &[
+            "frontend",
+            "ui",
+            "react",
+            "vue",
+            "css",
+            "page",
+            "component",
+            "dashboard",
+        ],
+    ),
+    (
+        "backend",
+        &["backend", "api", "endpoint", "server", "handler", "route"],
+    ),
+    (
+        "database",
+        &[
+            "database",
+            "postgres",
+            "sql",
+            "schema",
+            "migration",
+            "table",
+            "query",
+        ],
+    ),
+    (
+        "infra",
+        &[
+            "docker",
+            "kubernetes",
+            "deploy",
+            "ci",
+            "terraform",
+            "infrastructure",
+            "compose",
+        ],
+    ),
+    (
+        "auth",
+        &["auth", "login", "oauth", "permission", "role", "session"],
+    ),
+    ("testing", &["test", "pytest", "spec", "coverage"]),
+    ("docs", &["documentation", "readme", "docs", "guide"]),
+    (
+        "data",
+        &[
+            "etl",
+            "pipeline",
+            "analytics",
+            "report",
+            "machine learning",
+            "model",
+        ],
+    ),
+];
+
+/// Verbs that mean "make a thing that does not exist yet".
+///
+/// Construction is reliably more work than modification, and the noun lexicon
+/// misses it entirely: "build an inventory tracker" contains no size term.
+pub const CONSTRUCTION_VERBS: &[&str] = &[
+    "build",
+    "create",
+    "implement",
+    "develop",
+    "design",
+    "scaffold",
+    "bootstrap",
+    "generate",
+    "set up",
+    "stand up",
+    "write a",
+    "write an",
+    "make me",
+    "make a",
+    "make an",
+];

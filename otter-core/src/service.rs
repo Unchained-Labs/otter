@@ -13,7 +13,7 @@ use tracing::{info, warn};
 use uuid::Uuid;
 use validator::Validate;
 
-use crate::config::AppConfig;
+use crate::config::{AppConfig, SchedulingConfig};
 use crate::db::Database;
 use crate::domain::{
     CreateProjectRequest, CreateWorkspaceRequest, EnqueuePromptRequest, Job, JobEvent, JobStatus,
@@ -25,6 +25,7 @@ use crate::runtime::docker_manager::{DockerRuntimeManager, RuntimeExecResult};
 use crate::runtime::shell_session::build_shell_session_key;
 use crate::vibe::{VibeExecutor, VibeOutputChunk};
 use crate::workspace::WorkspaceManager;
+use otter_complexity::{assess_with_context, TaskAssessment, TaskContext};
 
 const DEFAULT_QUEUE_NAME: &str = "otter:jobs";
 
@@ -39,6 +40,7 @@ pub struct OtterService<Q: Queue> {
     pub default_workspace_subdir: String,
     pub runtime_manager: Option<Arc<DockerRuntimeManager>>,
     pub runtime_shell_cwds: Arc<Mutex<std::collections::HashMap<String, String>>>,
+    pub scheduling: SchedulingConfig,
 }
 
 impl<Q: Queue> OtterService<Q> {
@@ -79,6 +81,7 @@ impl<Q: Queue> OtterService<Q> {
                 None
             },
             runtime_shell_cwds: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            scheduling: config.scheduling.clone(),
         }
     }
 
@@ -146,8 +149,28 @@ impl<Q: Queue> OtterService<Q> {
         if let Some(dependency_ids) = request.dependency_job_ids.as_ref() {
             self.db.add_job_dependencies(job.id, dependency_ids).await?;
         }
+
+        // Score the prompt so the scheduler can order this against everything
+        // else waiting. Scoring is local and deterministic, so this costs
+        // microseconds and cannot fail the enqueue.
+        let assessment = self.score_and_store(&job, &request).await?;
+
         self.db
             .insert_job_event(job.id, "accepted", serde_json::json!({}))
+            .await?;
+        self.db
+            .insert_job_event(
+                job.id,
+                "assessed",
+                serde_json::json!({
+                    "complexity": assessment.complexity,
+                    "size": assessment.size,
+                    "intensity": assessment.intensity,
+                    "band": assessment.band.as_str(),
+                    "estimated_minutes": assessment.estimated_minutes,
+                    "confidence": assessment.confidence,
+                }),
+            )
             .await?;
         if let Some(project_path) = request.project_path.as_ref() {
             self.db
@@ -180,6 +203,116 @@ impl<Q: Queue> OtterService<Q> {
             "job accepted and queued"
         );
         Ok(job)
+    }
+
+    /// Score a job's prompt and persist the result.
+    async fn score_and_store(
+        &self,
+        job: &Job,
+        request: &EnqueuePromptRequest,
+    ) -> Result<TaskAssessment> {
+        let context = TaskContext {
+            dependency_count: request
+                .dependency_job_ids
+                .as_ref()
+                .map(Vec::len)
+                .unwrap_or(0),
+            scoped_to_project_path: request
+                .project_path
+                .as_deref()
+                .map(|path| !path.trim().is_empty())
+                .unwrap_or(false),
+        };
+        let assessment = assess_with_context(&job.prompt, &context);
+        self.persist_assessment(job.id, &assessment).await?;
+
+        info!(
+            job_id = %job.id,
+            complexity = assessment.complexity,
+            size = assessment.size,
+            intensity = assessment.intensity,
+            band = assessment.band.as_str(),
+            estimated_minutes = assessment.estimated_minutes,
+            "task assessed"
+        );
+        Ok(assessment)
+    }
+
+    async fn persist_assessment(&self, job_id: Uuid, assessment: &TaskAssessment) -> Result<()> {
+        self.db
+            .set_job_assessment(
+                job_id,
+                i16::from(assessment.complexity),
+                i16::from(assessment.size),
+                assessment.intensity as i16,
+                assessment.band.as_str(),
+                assessment.estimated_minutes as i32,
+                assessment.confidence,
+                serde_json::to_value(assessment)?,
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Score a prompt without enqueuing anything.
+    ///
+    /// Lets a client show the cost of a task before committing to it, and lets
+    /// external planners rank work using the same engine the scheduler uses.
+    pub fn assess_prompt(&self, prompt: &str, context: &TaskContext) -> TaskAssessment {
+        assess_with_context(prompt, context)
+    }
+
+    /// Replace a job's heuristic score with a refined one.
+    ///
+    /// The queue re-orders on the next claim, so a correction takes effect
+    /// immediately for anything still waiting.
+    pub async fn refine_job_assessment(
+        &self,
+        job_id: Uuid,
+        complexity: u8,
+        size: u8,
+        confidence: f32,
+    ) -> Result<Option<TaskAssessment>> {
+        let Some(job) = self.db.fetch_job(job_id).await? else {
+            return Ok(None);
+        };
+
+        // Rebuild from the stored assessment when present so the original
+        // signals survive the override; fall back to re-scoring the prompt.
+        let base = job
+            .assessment
+            .clone()
+            .and_then(|value| serde_json::from_value::<TaskAssessment>(value).ok())
+            .unwrap_or_else(|| assess_with_context(&job.prompt, &TaskContext::default()));
+
+        let refined = base.with_refinement(complexity, size, confidence);
+        self.persist_assessment(job_id, &refined).await?;
+        self.db
+            .insert_job_event(
+                job_id,
+                "assessment_refined",
+                serde_json::json!({
+                    "complexity": refined.complexity,
+                    "size": refined.size,
+                    "intensity": refined.intensity,
+                    "band": refined.band.as_str(),
+                }),
+            )
+            .await?;
+        Ok(Some(refined))
+    }
+
+    /// Whether the queue backend is reachable.
+    ///
+    /// A queue outage degrades latency rather than correctness: the worker
+    /// claims from the database regardless, and queue messages only shorten the
+    /// wait between a submission and the claim that picks it up.
+    pub async fn queue_healthy(&self) -> bool {
+        self.queue.dequeue("otter:health-probe").await.is_ok()
+    }
+
+    pub async fn queue_statistics(&self) -> Result<crate::db::QueueStatistics> {
+        self.db.queue_statistics().await
     }
 
     async fn resolve_default_workspace_id(&self) -> Result<Uuid> {
@@ -345,7 +478,15 @@ impl<Q: Queue> OtterService<Q> {
             info!(job_id = %message.job_id, "dequeued wake-up hint from redis");
         }
 
-        let Some(job) = self.db.claim_next_runnable_job().await? else {
+        let Some(job) = self
+            .db
+            .claim_next_runnable_job(
+                self.scheduling.strategy,
+                self.scheduling.aging_interval_seconds,
+                self.scheduling.aging_step,
+            )
+            .await?
+        else {
             return Ok(None);
         };
         info!(
@@ -809,7 +950,15 @@ impl<Q: Queue> OtterService<Q> {
     }
 
     pub async fn list_queue(&self, limit: i64, offset: i64) -> Result<Vec<QueueItem>> {
-        self.db.list_queue(limit, offset).await
+        self.db
+            .list_queue(
+                limit,
+                offset,
+                self.scheduling.strategy,
+                self.scheduling.aging_interval_seconds,
+                self.scheduling.aging_step,
+            )
+            .await
     }
 
     pub async fn update_queue_position(

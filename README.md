@@ -9,9 +9,12 @@ It accepts prompts through HTTP endpoints, queues and schedules work, executes `
 ## Features
 
 - Rust workspace architecture:
+  - `otter-complexity`: deterministic task complexity/size scoring + MCP server.
   - `otter-core`: orchestration domain library.
   - `otter-server`: HTTP API.
   - `otter-worker`: async queue consumer.
+- Complexity-aware scheduling: tasks are scored at enqueue and short, simple work
+  clears first, with ageing so long jobs are never starved.
 - PostgreSQL persistence for projects, workspaces, jobs, outputs, and events.
 - Redis-backed queueing and worker retry lifecycle.
 - Isolated per-workspace `VIBE_HOME` trust model.
@@ -70,6 +73,9 @@ curl http://localhost:8080/healthz
 - `OTTER_API_BASE_URL` (default `http://otter-server:8080`, used in system prompt instructions so Vibe can post job preview URLs)
 - `OTTER_DEFAULT_WORKSPACE_PATH` (optional fallback workspace root when enqueue omits `workspace_id`)
 - `OTTER_MAX_ATTEMPTS` (default `5`)
+- `OTTER_SCHEDULING_STRATEGY` (`smart` default, or `priority`, `fifo`)
+- `OTTER_SCHEDULING_AGING_SECONDS` (default `600`) — how often a waiting job sheds intensity
+- `OTTER_SCHEDULING_AGING_STEP` (default `5`) — intensity shed per interval
 - `OTTER_WORKER_CONCURRENCY` (default `1`)
 - `OTTER_ALLOWED_ROOTS` (optional `:`-separated allowlist)
 - `OTTER_RUNTIME_ENABLED` (default `false`, enables sibling container runtime)
@@ -102,6 +108,9 @@ These are forwarded as `VIBE_MODEL` / `MISTRAL_MODEL` and `VIBE_PROVIDER` for co
 - `GET /v1/jobs/{id}`
 - `GET /v1/jobs/{id}/events`
 - `GET /v1/events/stream` (includes `output_chunk` events; optional `?job_id=` filters to a single job)
+- `POST /v1/complexity/score` (score a prompt without enqueuing it)
+- `POST /v1/jobs/{id}/assessment` (override a job's heuristic score)
+- `GET /readyz` (readiness incl. dependency checks), `GET /metrics` (Prometheus)
 - `POST /v1/jobs/{id}/cancel`
 - `POST /v1/jobs/{id}/pause`
 - `POST /v1/jobs/{id}/resume`

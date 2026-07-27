@@ -1,0 +1,16 @@
+[package]
+name = "otter-complexity"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+description = "Deterministic complexity and size scoring for natural-language build tasks."
+
+# Deliberately free of Otter dependencies: this crate knows nothing about jobs,
+# queues or databases, so it can be lifted into its own repository unchanged.
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[[bin]]
+name = "otter-complexity-mcp"
+path = "src/bin/mcp.rs"

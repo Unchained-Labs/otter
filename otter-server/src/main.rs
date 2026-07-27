@@ -233,6 +233,9 @@ async fn main() -> Result<()> {
 
     let app = Router::new()
         .route("/healthz", get(healthz))
+        .route("/readyz", get(readyz))
+        .route("/metrics", get(metrics))
+        .route("/v1/complexity/score", post(score_prompt))
         .route("/v1/projects", post(create_project).get(list_projects))
         .route(
             "/v1/workspaces",
@@ -279,6 +282,7 @@ async fn main() -> Result<()> {
         .route("/v1/jobs/{id}/project-path", post(set_job_project_path))
         .route("/v1/jobs/{id}/dependencies", post(set_job_dependencies))
         .route("/v1/jobs/{id}/runtime-launch", post(set_job_runtime_launch))
+        .route("/v1/jobs/{id}/assessment", post(refine_job_assessment))
         .route(
             "/v1/jobs/{id}/runtime-launch/start",
             post(start_job_runtime_launch),
@@ -362,8 +366,145 @@ async fn connect_redis_with_retry(redis_url: &str) -> Result<Arc<RedisQueue>> {
     }
 }
 
+/// Liveness. Answers as long as the process is up, so an orchestrator restarts
+/// it only when it is genuinely wedged, not when a dependency is briefly down.
 async fn healthz() -> impl IntoResponse {
     (StatusCode::OK, "ok")
+}
+
+/// Readiness. Unlike `/healthz` this actually exercises the dependencies, so a
+/// load balancer stops sending traffic to an instance that cannot serve it.
+///
+/// Returns 503 with a per-dependency breakdown when anything is unreachable.
+async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
+    let database = state.service.db.ping().await.is_ok();
+    // A queue outage degrades latency rather than correctness — the worker polls
+    // the database anyway — so it is reported but does not fail readiness.
+    let queue = state.service.queue_healthy().await;
+
+    let ready = database;
+    let body = serde_json::json!({
+        "ready": ready,
+        "checks": { "database": database, "queue": queue },
+    });
+
+    let status = if ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (status, Json(body))
+}
+
+/// Prometheus text-format metrics.
+///
+/// Exposes queue depth and composition, including the intensity distribution
+/// the scheduler orders on, so backlog pressure is visible without querying the
+/// database by hand.
+async fn metrics(State(state): State<AppState>) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let stats = state
+        .service
+        .queue_statistics()
+        .await
+        .map_err(internal_error)?;
+
+    let body = format!(
+        "# HELP otter_jobs_total Jobs by terminal or current status.\n\
+         # TYPE otter_jobs_total gauge\n\
+         otter_jobs_total{{status=\"queued\"}} {}\n\
+         otter_jobs_total{{status=\"running\"}} {}\n\
+         otter_jobs_total{{status=\"succeeded\"}} {}\n\
+         otter_jobs_total{{status=\"failed\"}} {}\n\
+         otter_jobs_total{{status=\"cancelled\"}} {}\n\
+         # HELP otter_jobs_paused Queued jobs currently paused.\n\
+         # TYPE otter_jobs_paused gauge\n\
+         otter_jobs_paused {}\n\
+         # HELP otter_queue_intensity_avg Mean intensity of queued jobs (0-100).\n\
+         # TYPE otter_queue_intensity_avg gauge\n\
+         otter_queue_intensity_avg {:.2}\n\
+         # HELP otter_queue_estimated_minutes Estimated work remaining in the queue.\n\
+         # TYPE otter_queue_estimated_minutes gauge\n\
+         otter_queue_estimated_minutes {}\n",
+        stats.queued,
+        stats.running,
+        stats.succeeded,
+        stats.failed,
+        stats.cancelled,
+        stats.paused,
+        stats.avg_queued_intensity,
+        stats.queued_estimated_minutes,
+    );
+
+    Ok((
+        StatusCode::OK,
+        [("content-type", "text/plain; version=0.0.4")],
+        body,
+    ))
+}
+
+#[derive(serde::Deserialize)]
+struct ScorePromptRequest {
+    prompt: String,
+    dependency_count: Option<usize>,
+    scoped_to_project_path: Option<bool>,
+}
+
+/// Score a prompt without enqueuing it.
+///
+/// Lets a client show what a task will cost before committing to it, and lets
+/// external planners rank work with the same engine the scheduler uses.
+async fn score_prompt(
+    State(state): State<AppState>,
+    Json(body): Json<ScorePromptRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    if body.prompt.trim().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "prompt must not be empty".to_string(),
+        ));
+    }
+    let context = otter_complexity::TaskContext {
+        dependency_count: body.dependency_count.unwrap_or(0),
+        scoped_to_project_path: body.scoped_to_project_path.unwrap_or(false),
+    };
+    Ok(Json(state.service.assess_prompt(&body.prompt, &context)))
+}
+
+#[derive(serde::Deserialize)]
+struct RefineAssessmentRequest {
+    complexity: u8,
+    size: u8,
+    confidence: Option<f32>,
+}
+
+/// Override a job's heuristic score.
+///
+/// Intended for an agent or a reviewer who knows better than the heuristics. The
+/// queue re-orders on the next claim, so a correction applies immediately to
+/// anything still waiting.
+async fn refine_job_assessment(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(body): Json<RefineAssessmentRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    if !(1..=10).contains(&body.complexity) || !(1..=10).contains(&body.size) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "complexity and size must be between 1 and 10".to_string(),
+        ));
+    }
+    let refined = state
+        .service
+        .refine_job_assessment(
+            id,
+            body.complexity,
+            body.size,
+            body.confidence.unwrap_or(0.9),
+        )
+        .await
+        .map_err(internal_error)?
+        .ok_or((StatusCode::NOT_FOUND, "job not found".to_string()))?;
+    Ok(Json(refined))
 }
 
 async fn create_project(

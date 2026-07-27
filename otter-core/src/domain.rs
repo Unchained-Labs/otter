@@ -53,6 +53,17 @@ pub struct Job {
     pub error: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// Conceptual difficulty, 1..=10. `None` for jobs enqueued before scoring existed.
+    pub complexity: Option<i16>,
+    /// Volume of work, 1..=10.
+    pub task_size: Option<i16>,
+    /// Combined scheduling weight, 0..=100. Lower runs sooner.
+    pub intensity: Option<i16>,
+    pub complexity_band: Option<String>,
+    pub estimated_minutes: Option<i32>,
+    pub assessment_confidence: Option<f32>,
+    /// Full assessment, including the signals behind the score.
+    pub assessment: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
@@ -133,6 +144,14 @@ pub struct QueueItem {
     pub schedule_at: Option<DateTime<Utc>>,
     pub queue_rank: i64,
     pub created_at: DateTime<Utc>,
+    pub complexity: Option<i16>,
+    pub task_size: Option<i16>,
+    pub intensity: Option<i16>,
+    pub complexity_band: Option<String>,
+    pub estimated_minutes: Option<i32>,
+    /// Intensity after ageing. This is what the scheduler actually sorts on, so
+    /// the board can show why a long-waiting large job is moving up.
+    pub effective_intensity: Option<i32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

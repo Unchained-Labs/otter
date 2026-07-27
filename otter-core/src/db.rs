@@ -6,11 +6,25 @@ use sqlx::Row;
 use std::path::PathBuf;
 use uuid::Uuid;
 
+use crate::config::SchedulingStrategy;
 use crate::domain::{
     CreateProjectRequest, CreateWorkspaceRequest, HistoryItem, Job, JobEvent, JobOutput,
     JobRuntimeAppRegistryEntry, JobStatus, Project, QueueItem, RuntimePortBinding, Workspace,
     WorkspaceRuntimeRegistryEntry,
 };
+
+/// Aggregate counts for operational reporting.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct QueueStatistics {
+    pub queued: i64,
+    pub running: i64,
+    pub succeeded: i64,
+    pub failed: i64,
+    pub cancelled: i64,
+    pub paused: i64,
+    pub avg_queued_intensity: f64,
+    pub queued_estimated_minutes: i64,
+}
 
 #[derive(Clone)]
 pub struct Database {
@@ -28,6 +42,12 @@ impl Database {
 
     pub fn pool(&self) -> &PgPool {
         &self.pool
+    }
+
+    /// Cheapest possible round trip, for readiness checks.
+    pub async fn ping(&self) -> Result<()> {
+        sqlx::query("SELECT 1").execute(&self.pool).await?;
+        Ok(())
     }
 
     pub async fn migrate(&self) -> Result<()> {
@@ -147,7 +167,7 @@ impl Database {
             r#"
             INSERT INTO jobs (workspace_id, prompt, status, priority, schedule_at, project_path, attempts, max_attempts)
             VALUES ($1, $2, 'queued', $3, $4, $5, 0, $6)
-            RETURNING id, workspace_id, prompt, preview_url, project_path, runtime_start_command, runtime_stop_command, runtime_command_cwd, is_paused, status, priority, schedule_at, attempts, max_attempts, error, created_at, updated_at
+            RETURNING id, workspace_id, prompt, preview_url, project_path, runtime_start_command, runtime_stop_command, runtime_command_cwd, is_paused, status, priority, schedule_at, attempts, max_attempts, error, created_at, updated_at, complexity, task_size, intensity, complexity_band, estimated_minutes, assessment_confidence, assessment
             "#,
         )
         .bind(workspace_id)
@@ -164,7 +184,7 @@ impl Database {
     pub async fn fetch_job(&self, job_id: Uuid) -> Result<Option<Job>> {
         let job = sqlx::query_as::<_, Job>(
             r#"
-            SELECT id, workspace_id, prompt, preview_url, project_path, runtime_start_command, runtime_stop_command, runtime_command_cwd, is_paused, status, priority, schedule_at, attempts, max_attempts, error, created_at, updated_at
+            SELECT id, workspace_id, prompt, preview_url, project_path, runtime_start_command, runtime_stop_command, runtime_command_cwd, is_paused, status, priority, schedule_at, attempts, max_attempts, error, created_at, updated_at, complexity, task_size, intensity, complexity_band, estimated_minutes, assessment_confidence, assessment
             FROM jobs WHERE id = $1
             "#,
         )
@@ -306,17 +326,43 @@ impl Database {
         Ok(event)
     }
 
-    /// Claim the highest-priority runnable job.
+    /// Claim the next runnable job according to `strategy`.
     ///
-    /// Execution order is decided here, by `priority ASC, created_at ASC`, so that
-    /// reordering the board actually reorders the work. Claiming a job named by a
-    /// queue message instead would pin execution to Redis insertion order and make
-    /// the queue-position API cosmetic.
+    /// Execution order is decided here rather than by Redis insertion order, so
+    /// that repositioning the board actually reorders the work.
     ///
-    /// `FOR UPDATE SKIP LOCKED` lets concurrent workers claim distinct jobs without
-    /// blocking on each other.
-    pub async fn claim_next_runnable_job(&self) -> Result<Option<Job>> {
-        let job = sqlx::query_as::<_, Job>(
+    /// Under [`SchedulingStrategy::Smart`] the order is explicit queue position
+    /// first, then *aged intensity* ascending. Cheap work therefore clears ahead
+    /// of expensive work, which shortens the average wait across the queue —
+    /// but a job sheds `aging_step` intensity per `aging_interval_seconds`
+    /// waited, so a large job cannot be starved by an unending stream of small
+    /// ones. It only ever falls behind newcomers for a bounded time.
+    ///
+    /// Priority stays the outermost key because it is the one signal a human set
+    /// deliberately; a heuristic score must not override an explicit decision.
+    /// Jobs predating scoring have NULL intensity and are treated as mid-range,
+    /// so they neither jump the queue nor sink to the bottom.
+    ///
+    /// `FOR UPDATE SKIP LOCKED` lets concurrent workers claim distinct jobs
+    /// without blocking on each other.
+    pub async fn claim_next_runnable_job(
+        &self,
+        strategy: SchedulingStrategy,
+        aging_interval_seconds: i64,
+        aging_step: i32,
+    ) -> Result<Option<Job>> {
+        let order_by = match strategy {
+            SchedulingStrategy::Fifo => "j.created_at ASC",
+            SchedulingStrategy::Priority => "j.priority ASC, j.created_at ASC",
+            SchedulingStrategy::Smart => {
+                "j.priority ASC, \
+                 GREATEST(0, COALESCE(j.intensity, 50) \
+                   - (FLOOR(EXTRACT(EPOCH FROM (now() - j.created_at)) / $1) * $2)) ASC, \
+                 j.created_at ASC"
+            }
+        };
+
+        let sql = format!(
             r#"
             UPDATE jobs
             SET status = 'running',
@@ -334,16 +380,96 @@ impl Database {
                     WHERE dep.job_id = j.id
                       AND parent.status <> 'succeeded'
                   )
-                ORDER BY j.priority ASC, j.created_at ASC
+                ORDER BY {order_by}
                 LIMIT 1
                 FOR UPDATE SKIP LOCKED
             )
-            RETURNING id, workspace_id, prompt, preview_url, project_path, runtime_start_command, runtime_stop_command, runtime_command_cwd, is_paused, status, priority, schedule_at, attempts, max_attempts, error, created_at, updated_at
+            RETURNING id, workspace_id, prompt, preview_url, project_path, runtime_start_command, runtime_stop_command, runtime_command_cwd, is_paused, status, priority, schedule_at, attempts, max_attempts, error, created_at, updated_at, complexity, task_size, intensity, complexity_band, estimated_minutes, assessment_confidence, assessment
+            "#
+        );
+
+        let mut query = sqlx::query_as::<_, Job>(&sql);
+        if matches!(strategy, SchedulingStrategy::Smart) {
+            query = query
+                .bind(aging_interval_seconds as f64)
+                .bind(aging_step as f64);
+        }
+        let job = query.fetch_optional(&self.pool).await?;
+        Ok(job)
+    }
+
+    /// Persist an assessment onto a job.
+    ///
+    /// Separate from `create_job` so scoring can also be re-run later — after a
+    /// prompt edit, or when an agent refines the score through the API.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn set_job_assessment(
+        &self,
+        job_id: Uuid,
+        complexity: i16,
+        task_size: i16,
+        intensity: i16,
+        band: &str,
+        estimated_minutes: i32,
+        confidence: f32,
+        assessment: Value,
+    ) -> Result<bool> {
+        let result = sqlx::query(
+            r#"
+            UPDATE jobs
+            SET complexity = $2,
+                task_size = $3,
+                intensity = $4,
+                complexity_band = $5,
+                estimated_minutes = $6,
+                assessment_confidence = $7,
+                assessment = $8,
+                updated_at = now()
+            WHERE id = $1
             "#,
         )
-        .fetch_optional(&self.pool)
+        .bind(job_id)
+        .bind(complexity)
+        .bind(task_size)
+        .bind(intensity)
+        .bind(band)
+        .bind(estimated_minutes)
+        .bind(confidence)
+        .bind(assessment)
+        .execute(&self.pool)
         .await?;
-        Ok(job)
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Aggregate queue statistics, for `/metrics` and capacity reporting.
+    pub async fn queue_statistics(&self) -> Result<QueueStatistics> {
+        let row = sqlx::query(
+            r#"
+            SELECT
+              COUNT(*) FILTER (WHERE status = 'queued')::bigint    AS queued,
+              COUNT(*) FILTER (WHERE status = 'running')::bigint   AS running,
+              COUNT(*) FILTER (WHERE status = 'succeeded')::bigint AS succeeded,
+              COUNT(*) FILTER (WHERE status = 'failed')::bigint    AS failed,
+              COUNT(*) FILTER (WHERE status = 'cancelled')::bigint AS cancelled,
+              COUNT(*) FILTER (WHERE status = 'queued' AND is_paused)::bigint AS paused,
+              COALESCE(AVG(intensity) FILTER (WHERE status = 'queued'), 0)::float8 AS avg_queued_intensity,
+              COALESCE(SUM(estimated_minutes) FILTER (WHERE status = 'queued'), 0)::bigint AS queued_estimated_minutes
+            FROM jobs
+            "#,
+        )
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(QueueStatistics {
+            queued: row.try_get("queued")?,
+            running: row.try_get("running")?,
+            succeeded: row.try_get("succeeded")?,
+            failed: row.try_get("failed")?,
+            cancelled: row.try_get("cancelled")?,
+            paused: row.try_get("paused")?,
+            avg_queued_intensity: row.try_get("avg_queued_intensity")?,
+            queued_estimated_minutes: row.try_get("queued_estimated_minutes")?,
+        })
     }
 
     pub async fn mark_job_cancelled(&self, job_id: Uuid) -> Result<PgQueryResult> {
@@ -471,8 +597,35 @@ impl Database {
         Ok(blocked)
     }
 
-    pub async fn list_queue(&self, limit: i64, offset: i64) -> Result<Vec<QueueItem>> {
-        let rows = sqlx::query_as::<_, QueueItem>(
+    /// List the queue in the order it will actually execute.
+    ///
+    /// `queue_rank` is computed with the same ordering as
+    /// [`Database::claim_next_runnable_job`] and must stay in step with it: a
+    /// board that ranks jobs differently from the scheduler is exactly the class
+    /// of bug where reordering appears to work but changes nothing.
+    pub async fn list_queue(
+        &self,
+        limit: i64,
+        offset: i64,
+        strategy: SchedulingStrategy,
+        aging_interval_seconds: i64,
+        aging_step: i32,
+    ) -> Result<Vec<QueueItem>> {
+        // Postgres cannot reference a SELECT-list alias from a window function's
+        // ORDER BY, so the ageing expression is inlined rather than reusing the
+        // `effective_intensity` alias computed alongside it.
+        const AGED_INTENSITY: &str = "GREATEST(0, COALESCE(intensity, 50) \
+             - (FLOOR(EXTRACT(EPOCH FROM (now() - created_at)) / $3) * $4))";
+
+        let order_by = match strategy {
+            SchedulingStrategy::Fifo => "created_at ASC".to_string(),
+            SchedulingStrategy::Priority => "priority ASC, created_at ASC".to_string(),
+            SchedulingStrategy::Smart => {
+                format!("priority ASC, {AGED_INTENSITY} ASC, created_at ASC")
+            }
+        };
+
+        let sql = format!(
             r#"
             SELECT
                 id AS job_id,
@@ -485,7 +638,13 @@ impl Database {
                 priority,
                 schedule_at,
                 queue_rank,
-                created_at
+                created_at,
+                complexity,
+                task_size,
+                intensity,
+                complexity_band,
+                estimated_minutes,
+                effective_intensity
             FROM (
                 SELECT
                     id,
@@ -514,21 +673,31 @@ impl Database {
                     priority,
                     schedule_at,
                     created_at,
-                    row_number() OVER (
-                        ORDER BY priority ASC, created_at ASC
-                    ) AS queue_rank
+                    complexity,
+                    task_size,
+                    intensity,
+                    complexity_band,
+                    estimated_minutes,
+                    GREATEST(0, COALESCE(intensity, 50)
+                        - (FLOOR(EXTRACT(EPOCH FROM (now() - created_at)) / $3) * $4)
+                    )::int AS effective_intensity,
+                    row_number() OVER (ORDER BY {order_by}) AS queue_rank
                 FROM jobs
                 WHERE status = 'queued'
                   AND (schedule_at IS NULL OR schedule_at <= now() OR is_paused = true)
             ) queued
             ORDER BY queue_rank ASC
             LIMIT $1 OFFSET $2
-            "#,
-        )
-        .bind(limit)
-        .bind(offset)
-        .fetch_all(&self.pool)
-        .await?;
+            "#
+        );
+
+        let rows = sqlx::query_as::<_, QueueItem>(&sql)
+            .bind(limit)
+            .bind(offset)
+            .bind(aging_interval_seconds as f64)
+            .bind(aging_step as f64)
+            .fetch_all(&self.pool)
+            .await?;
         Ok(rows)
     }
 

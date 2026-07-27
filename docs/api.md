@@ -114,11 +114,66 @@ Base URL: `http://<host>:8080`
     { "priority": 10 }
     ```
   - Repositions queued jobs by updating priority.
-  - Workers claim the runnable job with the lowest `priority` (ties broken by
-    `created_at`), so repositioning changes execution order, not just display order.
+  - Workers claim the runnable job with the lowest `priority`, so repositioning
+    changes execution order, not just display order. Ties are broken by aged
+    intensity — see [Task Complexity And Scheduling](#task-complexity-and-scheduling).
 
 ## Operational Visibility
 
 - HTTP request tracing is enabled server-side (status + latency).
 - Job lifecycle logs are emitted by worker/service layers for enqueue/claim/retry/fail/complete states.
 - Runtime shell commands auto-recover when workspace container is missing/stopped before falling back to host workspace shell execution.
+
+## Task Complexity And Scheduling
+
+Every job is scored at enqueue by [`otter-complexity`](../otter-complexity/README.md):
+`complexity` (1–10), `task_size` (1–10) and `intensity` (0–100), plus a band, an
+estimate and the signals behind the score. Scoring is local, deterministic and
+adds no measurable latency to enqueue.
+
+- `POST /v1/complexity/score`
+  - Body: `{ "prompt": "...", "dependency_count": 0, "scoped_to_project_path": false }`
+  - Returns a full assessment without enqueuing anything. Use it to show what a
+    task will cost before committing to it, or to rank a backlog externally.
+- `POST /v1/jobs/{id}/assessment`
+  - Body: `{ "complexity": 7, "size": 4, "confidence": 0.9 }`
+  - Overrides the heuristic score. The queue re-orders on the next claim, so a
+    correction takes effect immediately for anything still waiting.
+
+### Scheduling
+
+`OTTER_SCHEDULING_STRATEGY` selects how the worker picks the next job:
+
+| Strategy | Order |
+|---|---|
+| `smart` (default) | `priority`, then aged intensity, then `created_at` |
+| `priority` | `priority`, then `created_at` |
+| `fifo` | `created_at` only |
+
+Under `smart`, cheap work clears ahead of expensive work, which shortens the
+average wait across the queue. Explicit `priority` remains the outermost key:
+it is the one signal a human set deliberately, and a heuristic must not override
+an explicit decision.
+
+To prevent starvation, a waiting job sheds `OTTER_SCHEDULING_AGING_STEP`
+intensity every `OTTER_SCHEDULING_AGING_SECONDS`. The defaults shed the full
+0–100 range over roughly three hours, so a large job falls behind newcomers only
+for a bounded time. Ageing much faster makes the queue effectively FIFO and
+throws away the throughput gain scoring exists to provide.
+
+`GET /v1/queue` returns `intensity`, `complexity_band`, `estimated_minutes` and
+`effective_intensity` (intensity after ageing), and ranks rows with the same
+ordering the scheduler uses — the board and the worker never disagree.
+
+Jobs enqueued before scoring existed have `NULL` intensity and are treated as
+mid-range, so they neither jump the queue nor sink to the bottom.
+
+## Operability
+
+- `GET /healthz` — liveness. Answers whenever the process is up.
+- `GET /readyz` — readiness. Exercises the database and reports the queue;
+  returns 503 with a per-dependency breakdown when the database is unreachable.
+  A queue outage is reported but does not fail readiness: the worker claims from
+  the database regardless, so an outage costs latency, not correctness.
+- `GET /metrics` — Prometheus text format: job counts by status, paused count,
+  mean queued intensity, and total estimated minutes of queued work.
