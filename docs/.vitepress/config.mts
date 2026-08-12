@@ -31,6 +31,7 @@ export default defineConfig({
       { text: 'Architecture', link: '/architecture' },
       { text: 'API', link: '/api' },
       { text: 'Tutorials', link: '/tutorials/getting-started' },
+      { text: 'Observability', link: '/observability' },
       { text: 'Operations', link: '/runbook' },
       { text: 'References', link: '/related-documents' }
     ],
@@ -66,6 +67,7 @@ export default defineConfig({
         collapsed: false,
         items: [
           { text: 'Runbook', link: '/runbook' },
+          { text: 'Observability', link: '/observability' },
           { text: 'NUC Operations', link: '/operations-nuc' },
           { text: 'Workspace Trust Model', link: '/workspace-trust-model' }
         ]

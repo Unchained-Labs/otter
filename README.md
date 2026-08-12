@@ -79,6 +79,7 @@ curl http://localhost:8080/healthz
 - `OTTER_RUNTIME_IMAGE_PREFIX` (default `otter/workspace`)
 - `OTTER_RUNTIME_DEFAULT_HOST` (default `http://localhost`, used to compose preview URLs)
 - `OTTER_RUNTIME_MAX_LOG_LINES` (default `2000`)
+- `OTTER_MODEL_PRICING` (optional, `model=input:output` per million tokens, comma-separated, example `mistral-large-3=2.0:6.0`)
 - `MISTRAL_API_KEY` (read from `.env`, passed to server/worker/vibe process)
 
 ### Selecting a Vibe model
@@ -113,6 +114,39 @@ These are forwarded as `VIBE_MODEL` / `MISTRAL_MODEL` and `VIBE_PROVIDER` for co
 - `POST /v1/runtime/workspaces/{id}/start|stop|restart`
 - `GET /v1/runtime/workspaces/{id}/logs?tail=200`
 - `GET /v1/runtime/workspaces/{id}/shell/ws` (interactive command channel via websocket)
+- `GET /metrics` (Prometheus exposition: job outcomes, delivery rate, tokens, estimated cost)
+- `GET /v1/metrics/summary` (same aggregate as JSON, with derived rates)
+- `GET /v1/jobs/{id}/usage` (per-job tokens, estimated cost, and agent duration)
+
+## Observability and Evals
+
+Otter records token usage and estimated cost per job, and distinguishes jobs
+that merely *succeeded* from jobs that actually **delivered** — succeeded and
+published a reachable preview URL. Both rates are exported:
+
+```bash
+curl http://localhost:8080/metrics | grep -E "otter_(success|delivery)_rate"
+```
+
+Configure prices to enable cost estimation (USD per million tokens):
+
+```bash
+OTTER_MODEL_PRICING=mistral-large-3=2.0:6.0
+```
+
+Without a configured price, cost is reported as `null` rather than `0`, and
+token counts are still recorded.
+
+The [`evals/`](evals/README.md) suite runs real prompts against a live stack and
+scores them on delivery, duration, and cost:
+
+```bash
+cd evals
+./run_evals.py --dry-run     # validate without spending tokens
+./run_evals.py --tier smoke  # fastest useful signal
+```
+
+See [`docs/observability.md`](docs/observability.md) for the full metric list.
 
 ## Repository Structure
 
