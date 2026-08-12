@@ -1694,7 +1694,7 @@ fn normalize_relative_workspace_path(path: &str) -> Result<String, (StatusCode, 
         .split('/')
         .filter(|segment| !segment.is_empty())
         .collect::<Vec<_>>();
-    if clean_segments.iter().any(|segment| *segment == "..") {
+    if clean_segments.contains(&"..") {
         return Err((
             StatusCode::BAD_REQUEST,
             "path must not escape workspace root".to_string(),
