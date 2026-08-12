@@ -3,6 +3,8 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 
+use crate::usage::PricingTable;
+
 #[derive(Clone, Debug)]
 pub struct AppConfig {
     pub database_url: String,
@@ -21,6 +23,9 @@ pub struct AppConfig {
     pub max_attempts: i32,
     pub worker_concurrency: usize,
     pub runtime: RuntimeConfig,
+    /// Operator-supplied model prices used to estimate job cost. Empty by
+    /// default: token counts are still recorded, cost is simply unknown.
+    pub model_pricing: PricingTable,
 }
 
 #[derive(Clone, Debug)]
@@ -113,6 +118,9 @@ impl AppConfig {
                     .and_then(|value| value.parse::<usize>().ok())
                     .unwrap_or(2000),
             },
+            model_pricing: PricingTable::parse(
+                env::var("OTTER_MODEL_PRICING").unwrap_or_default().as_str(),
+            ),
         })
     }
 }

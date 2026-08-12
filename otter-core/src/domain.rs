@@ -64,6 +64,20 @@ pub struct JobOutput {
     pub created_at: DateTime<Utc>,
 }
 
+/// Recorded token consumption and estimated cost for a single job.
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct JobUsage {
+    pub job_id: Uuid,
+    pub model: Option<String>,
+    pub prompt_tokens: i64,
+    pub completion_tokens: i64,
+    pub total_tokens: i64,
+    /// `None` when no price is configured for the model — not zero.
+    pub estimated_cost_usd: Option<f64>,
+    pub duration_ms: Option<i64>,
+    pub created_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct JobEvent {
     pub id: Uuid,
