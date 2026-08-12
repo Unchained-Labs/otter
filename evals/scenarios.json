@@ -1,0 +1,67 @@
+{
+  "$schema": "./scenario-schema.md",
+  "description": "Prompt-to-build eval suite for Otter. Each scenario is a real prompt run against a live stack and scored on whether it produced a reachable app.",
+  "scenarios": [
+    {
+      "id": "static-landing",
+      "tier": "smoke",
+      "prompt": "Build a single-page static landing site for a coffee shop with a hero section, an opening-hours table, and a contact form that posts nowhere. Serve it with nginx in Docker.",
+      "timeout_seconds": 900,
+      "expect": {
+        "delivered": true,
+        "max_duration_seconds": 600
+      }
+    },
+    {
+      "id": "fastapi-health",
+      "tier": "smoke",
+      "prompt": "Build a FastAPI service with a /health endpoint returning {\"status\":\"ok\"} and a /quote endpoint returning a random quote as JSON. Run it in Docker on port 8000.",
+      "timeout_seconds": 900,
+      "expect": {
+        "delivered": true,
+        "max_duration_seconds": 600
+      }
+    },
+    {
+      "id": "express-crud-memory",
+      "tier": "core",
+      "prompt": "Build an Express API in TypeScript with in-memory CRUD for a 'task' resource (create, list, get, update, delete), input validation, and a /health endpoint. Containerise it and run it.",
+      "timeout_seconds": 1200,
+      "expect": {
+        "delivered": true,
+        "max_duration_seconds": 900
+      }
+    },
+    {
+      "id": "react-dashboard",
+      "tier": "core",
+      "prompt": "Build a React + Vite dashboard with three stat cards and a sortable table of mock sales data. Style it cleanly with CSS. Build it for production and serve the static output from Docker.",
+      "timeout_seconds": 1200,
+      "expect": {
+        "delivered": true,
+        "max_duration_seconds": 900
+      }
+    },
+    {
+      "id": "postgres-backed-api",
+      "tier": "hard",
+      "prompt": "Build a Go REST API backed by PostgreSQL with a migration for a 'notes' table and endpoints to create and list notes. Use docker compose so the database starts alongside the API.",
+      "timeout_seconds": 1800,
+      "expect": {
+        "delivered": true,
+        "max_duration_seconds": 1500
+      }
+    },
+    {
+      "id": "ambiguous-prompt",
+      "tier": "hard",
+      "prompt": "Make me something that tracks stuff.",
+      "timeout_seconds": 1200,
+      "expect": {
+        "delivered": true,
+        "max_duration_seconds": 900
+      },
+      "notes": "Deliberately underspecified. Measures whether the agent picks a reasonable interpretation and still ships something running, rather than stalling or asking."
+    }
+  ]
+}
