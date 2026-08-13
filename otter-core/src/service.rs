@@ -25,6 +25,7 @@ use crate::domain::{
 use crate::queue::{Queue, QueueMessage};
 use crate::runtime::docker_manager::{DockerRuntimeManager, RuntimeExecResult};
 use crate::runtime::shell_session::build_shell_session_key;
+use crate::usage::{extract_model_name, extract_token_usage, PricingTable};
 use crate::vibe::{VibeExecutor, VibeOutputChunk};
 use crate::workspace::WorkspaceManager;
 
@@ -41,6 +42,10 @@ pub struct OtterService<Q: Queue> {
     pub default_workspace_subdir: String,
     pub runtime_manager: Option<Arc<DockerRuntimeManager>>,
     pub runtime_shell_cwds: Arc<Mutex<std::collections::HashMap<String, String>>>,
+    pub model_pricing: Arc<PricingTable>,
+    /// Model configured for the agent, used to price runs whose transcript does
+    /// not name the model itself.
+    pub configured_model: Option<String>,
 }
 
 impl<Q: Queue> OtterService<Q> {
@@ -81,6 +86,8 @@ impl<Q: Queue> OtterService<Q> {
                 None
             },
             runtime_shell_cwds: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            model_pricing: Arc::new(config.model_pricing.clone()),
+            configured_model: config.vibe_model.clone(),
         }
     }
 
@@ -480,6 +487,7 @@ impl<Q: Queue> OtterService<Q> {
             "executing vibe prompt"
         );
 
+        let execution_started_at = std::time::Instant::now();
         let result = self
             .vibe_executor
             .run_prompt_streaming(
@@ -511,12 +519,20 @@ impl<Q: Queue> OtterService<Q> {
                 },
             )
             .await?;
+        let execution_duration_ms = execution_started_at.elapsed().as_millis() as i64;
         info!(
             job_id = %job.id,
             exit_code = result.exit_code,
             output_chunks = output_chunk_count.load(Ordering::Relaxed),
+            duration_ms = execution_duration_ms,
             "vibe execution finished"
         );
+
+        // Recorded before the post-run hooks so a failing setup script or
+        // runtime provisioning step cannot lose the accounting for work that
+        // was already paid for.
+        self.record_job_usage(job.id, &result.raw_json, execution_duration_ms)
+            .await;
 
         match self
             .run_setup_script_with_streaming(job.id, &workspace_path)
@@ -673,6 +689,67 @@ impl<Q: Queue> OtterService<Q> {
             "job completed successfully"
         );
         Ok(())
+    }
+
+    /// Persists token accounting for a finished agent run.
+    ///
+    /// Deliberately infallible from the caller's perspective: telemetry must
+    /// never turn a successful build into a failed job. Errors are logged and
+    /// swallowed.
+    async fn record_job_usage(&self, job_id: Uuid, raw_json: &serde_json::Value, duration_ms: i64) {
+        let usage = extract_token_usage(raw_json);
+        // Prefer the model the transcript actually reports; fall back to the
+        // configured one, since not every provider echoes it back.
+        let model = extract_model_name(raw_json).or_else(|| self.configured_model.clone());
+        let estimated_cost_usd = self
+            .model_pricing
+            .estimate_cost_usd(model.as_deref(), &usage);
+
+        if usage.is_empty() {
+            // Still worth a row: it records the duration and keeps the job
+            // visible in eval reporting.
+            info!(
+                job_id = %job_id,
+                "agent transcript reported no token usage"
+            );
+        }
+
+        if let Err(error) = self
+            .db
+            .upsert_job_usage(
+                job_id,
+                model.as_deref(),
+                &usage,
+                estimated_cost_usd,
+                Some(duration_ms),
+            )
+            .await
+        {
+            warn!(
+                job_id = %job_id,
+                error = %error,
+                "failed to record job usage; execution is unaffected"
+            );
+            return;
+        }
+
+        info!(
+            job_id = %job_id,
+            model = model.as_deref().unwrap_or("unknown"),
+            prompt_tokens = usage.prompt_tokens,
+            completion_tokens = usage.completion_tokens,
+            total_tokens = usage.total_tokens,
+            estimated_cost_usd = estimated_cost_usd.unwrap_or(f64::NAN),
+            "recorded job usage"
+        );
+    }
+
+    pub async fn metrics_summary(&self) -> Result<crate::metrics::MetricsSummary> {
+        self.db.aggregate_metrics().await
+    }
+
+    pub async fn fetch_job_usage(&self, job_id: Uuid) -> Result<Option<crate::domain::JobUsage>> {
+        self.db.fetch_job_usage(job_id).await
     }
 
     async fn run_setup_script_with_streaming(

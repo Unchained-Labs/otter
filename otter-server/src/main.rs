@@ -299,6 +299,9 @@ async fn main() -> Result<()> {
             axum::routing::patch(update_queue_position),
         )
         .route("/v1/history", get(get_history))
+        .route("/metrics", get(get_prometheus_metrics))
+        .route("/v1/metrics/summary", get(get_metrics_summary))
+        .route("/v1/jobs/{id}/usage", get(get_job_usage))
         .with_state(state)
         .layer(TraceLayer::new_for_http().on_response(DefaultOnResponse::new().level(Level::INFO)))
         .layer(cors);
@@ -365,6 +368,62 @@ async fn connect_redis_with_retry(redis_url: &str) -> Result<Arc<RedisQueue>> {
 
 async fn healthz() -> impl IntoResponse {
     (StatusCode::OK, "ok")
+}
+
+/// Prometheus scrape endpoint.
+///
+/// Unversioned and served at the conventional `/metrics` path so standard
+/// scrape configs work without per-deployment overrides.
+async fn get_prometheus_metrics(
+    State(state): State<AppState>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let summary = state
+        .service
+        .metrics_summary()
+        .await
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    Ok((
+        StatusCode::OK,
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        summary.render_prometheus(),
+    ))
+}
+
+/// Same numbers as `/metrics`, shaped for dashboards and the eval harness.
+async fn get_metrics_summary(
+    State(state): State<AppState>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let summary = state
+        .service
+        .metrics_summary()
+        .await
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let success_rate = summary.success_rate();
+    let delivery_rate = summary.delivery_rate();
+    Ok(Json(serde_json::json!({
+        "summary": summary,
+        "success_rate": success_rate,
+        "delivery_rate": delivery_rate,
+    })))
+}
+
+async fn get_job_usage(
+    State(state): State<AppState>,
+    Path(job_id): Path<Uuid>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let usage = state
+        .service
+        .fetch_job_usage(job_id)
+        .await
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        .ok_or((
+            StatusCode::NOT_FOUND,
+            "no usage recorded for job".to_string(),
+        ))?;
+    Ok(Json(usage))
 }
 
 async fn create_project(
@@ -1635,7 +1694,7 @@ fn normalize_relative_workspace_path(path: &str) -> Result<String, (StatusCode, 
         .split('/')
         .filter(|segment| !segment.is_empty())
         .collect::<Vec<_>>();
-    if clean_segments.iter().any(|segment| *segment == "..") {
+    if clean_segments.contains(&"..") {
         return Err((
             StatusCode::BAD_REQUEST,
             "path must not escape workspace root".to_string(),

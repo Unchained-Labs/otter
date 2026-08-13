@@ -8,9 +8,11 @@ use uuid::Uuid;
 
 use crate::domain::{
     CreateProjectRequest, CreateWorkspaceRequest, HistoryItem, Job, JobEvent, JobOutput,
-    JobRuntimeAppRegistryEntry, JobStatus, Project, QueueItem, RuntimePortBinding, Workspace,
-    WorkspaceRuntimeRegistryEntry,
+    JobRuntimeAppRegistryEntry, JobStatus, JobUsage, Project, QueueItem, RuntimePortBinding,
+    Workspace, WorkspaceRuntimeRegistryEntry,
 };
+use crate::metrics::MetricsSummary;
+use crate::usage::TokenUsage;
 
 #[derive(Clone)]
 pub struct Database {
@@ -399,6 +401,109 @@ impl Database {
         .fetch_optional(&self.pool)
         .await?;
         Ok(output)
+    }
+
+    /// Records token usage for a job. Idempotent: a re-run overwrites rather
+    /// than accumulating, so a retried job reports its final attempt.
+    pub async fn upsert_job_usage(
+        &self,
+        job_id: Uuid,
+        model: Option<&str>,
+        usage: &TokenUsage,
+        estimated_cost_usd: Option<f64>,
+        duration_ms: Option<i64>,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO job_usage (
+                job_id, model, prompt_tokens, completion_tokens, total_tokens,
+                estimated_cost_usd, duration_ms
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            ON CONFLICT (job_id) DO UPDATE SET
+                model = EXCLUDED.model,
+                prompt_tokens = EXCLUDED.prompt_tokens,
+                completion_tokens = EXCLUDED.completion_tokens,
+                total_tokens = EXCLUDED.total_tokens,
+                estimated_cost_usd = EXCLUDED.estimated_cost_usd,
+                duration_ms = EXCLUDED.duration_ms
+            "#,
+        )
+        .bind(job_id)
+        .bind(model)
+        .bind(usage.prompt_tokens as i64)
+        .bind(usage.completion_tokens as i64)
+        .bind(usage.total_tokens as i64)
+        .bind(estimated_cost_usd)
+        .bind(duration_ms)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn fetch_job_usage(&self, job_id: Uuid) -> Result<Option<JobUsage>> {
+        let usage = sqlx::query_as::<_, JobUsage>(
+            r#"
+            SELECT job_id, model, prompt_tokens, completion_tokens, total_tokens,
+                   estimated_cost_usd, duration_ms, created_at
+            FROM job_usage
+            WHERE job_id = $1
+            "#,
+        )
+        .bind(job_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(usage)
+    }
+
+    /// Aggregates fleet-wide job outcomes and spend in a single round trip.
+    pub async fn aggregate_metrics(&self) -> Result<MetricsSummary> {
+        let row = sqlx::query(
+            r#"
+            SELECT
+                (SELECT count(*) FROM jobs)::bigint AS jobs_total,
+                (SELECT count(*) FROM jobs WHERE status = 'queued')::bigint AS jobs_queued,
+                (SELECT count(*) FROM jobs WHERE status = 'running')::bigint AS jobs_running,
+                (SELECT count(*) FROM jobs WHERE status = 'succeeded')::bigint AS jobs_succeeded,
+                (SELECT count(*) FROM jobs WHERE status = 'failed')::bigint AS jobs_failed,
+                (SELECT count(*) FROM jobs WHERE status = 'cancelled')::bigint AS jobs_cancelled,
+                (
+                    SELECT count(*) FROM jobs
+                    WHERE status = 'succeeded'
+                      AND preview_url IS NOT NULL
+                      AND length(trim(preview_url)) > 0
+                )::bigint AS jobs_delivered,
+                COALESCE((SELECT sum(prompt_tokens) FROM job_usage), 0)::bigint AS prompt_tokens_total,
+                COALESCE((SELECT sum(completion_tokens) FROM job_usage), 0)::bigint AS completion_tokens_total,
+                COALESCE((SELECT sum(total_tokens) FROM job_usage), 0)::bigint AS tokens_total,
+                COALESCE((SELECT sum(estimated_cost_usd) FROM job_usage), 0)::double precision AS estimated_cost_usd_total,
+                (SELECT count(*) FROM job_usage WHERE estimated_cost_usd IS NOT NULL)::bigint AS jobs_with_cost,
+                (
+                    SELECT avg(u.duration_ms)::double precision
+                    FROM job_usage u
+                    JOIN jobs j ON j.id = u.job_id
+                    WHERE j.status = 'succeeded' AND u.duration_ms IS NOT NULL
+                ) AS avg_duration_ms_succeeded
+            "#,
+        )
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(MetricsSummary {
+            jobs_total: row.try_get("jobs_total")?,
+            jobs_queued: row.try_get("jobs_queued")?,
+            jobs_running: row.try_get("jobs_running")?,
+            jobs_succeeded: row.try_get("jobs_succeeded")?,
+            jobs_failed: row.try_get("jobs_failed")?,
+            jobs_cancelled: row.try_get("jobs_cancelled")?,
+            jobs_delivered: row.try_get("jobs_delivered")?,
+            prompt_tokens_total: row.try_get("prompt_tokens_total")?,
+            completion_tokens_total: row.try_get("completion_tokens_total")?,
+            tokens_total: row.try_get("tokens_total")?,
+            estimated_cost_usd_total: row.try_get("estimated_cost_usd_total")?,
+            jobs_with_cost: row.try_get("jobs_with_cost")?,
+            avg_duration_ms_succeeded: row.try_get("avg_duration_ms_succeeded")?,
+        })
     }
 
     pub async fn queue_rank_for_job(&self, job_id: Uuid) -> Result<Option<i64>> {
