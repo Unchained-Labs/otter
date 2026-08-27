@@ -61,8 +61,14 @@ RUN apt-get update && \
     python3 -m pip install --no-cache-dir --break-system-packages psutil && \
     rm -rf /var/lib/apt/lists/*
 
+# The Vibe installer exits non-zero when its install directory is not
+# already on PATH — it installs successfully, prints an ERROR telling you
+# to add the directory, and returns 1, which fails the build. Put the
+# directory on PATH before running it.
+ENV PATH="/root/.local/bin:${PATH}"
 RUN curl -LsSf https://mistral.ai/vibe/install.sh | bash && \
-    ln -sf /root/.local/bin/vibe /usr/local/bin/vibe
+    ln -sf /root/.local/bin/vibe /usr/local/bin/vibe && \
+    vibe --version
 
 WORKDIR /srv/otter
 COPY --from=builder /app/otter-core/migrations /srv/otter/migrations
